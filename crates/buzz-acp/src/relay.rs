@@ -1292,6 +1292,40 @@ impl BgState {
         while let Some(event) = self.observer_in_flight.pop_back() {
             self.gated_observer_pending.push_front(event);
         }
+        self.trim_gated_observer_pending();
+    }
+
+    /// Re-park a frame the relay explicitly refused, ahead of frames parked
+    /// after the gate armed.
+    ///
+    /// An `OK(id, false, …)` names the refused frame, so only that frame is
+    /// retried — frames still awaiting their own verdict stay in the
+    /// acknowledgment window. This is the correlated counterpart to
+    /// [`Self::requeue_observer_in_flight`], which must retry everything
+    /// because a NOTICE identifies nothing.
+    fn requeue_rejected_observer_frame(&mut self, event_id: &str) {
+        let Some(index) = self
+            .observer_in_flight
+            .iter()
+            .position(|event| event.id.to_hex() == event_id)
+        else {
+            return;
+        };
+        if let Some(event) = self.observer_in_flight.remove(index) {
+            if self.gated_observer_pending.len() >= GATED_OBSERVER_QUEUE_CAP {
+                self.gated_observer_pending.pop_front();
+                self.gated_observer_dropped += 1;
+                warn!(
+                    dropped_total = self.gated_observer_dropped,
+                    "gated observer queue full — dropped oldest parked frame for refused retry"
+                );
+            }
+            self.gated_observer_pending.push_front(event);
+        }
+    }
+
+    /// Enforce the parked-queue bound, counting evictions so loss stays visible.
+    fn trim_gated_observer_pending(&mut self) {
         while self.gated_observer_pending.len() > GATED_OBSERVER_QUEUE_CAP {
             self.gated_observer_pending.pop_front();
             self.gated_observer_dropped += 1;
@@ -2282,7 +2316,10 @@ async fn handle_ws_message(
                 RelayMessage::Notice { message } => {
                     // Fix 4: NOTICE at warn level.
                     tracing::warn!("relay NOTICE: {message}");
-                    // The relay sends NOTICE for rate-limited EVENT/COUNT frames.
+                    // NOTICE now carries only connection-scoped refusals: an
+                    // EVENT is refused via OK and a REQ/COUNT via CLOSED. A
+                    // NOTICE names nothing, so every unacknowledged observer
+                    // write must be retried.
                     if message.starts_with("rate-limited:") {
                         let secs = parse_rate_limit_retry_secs(&message).unwrap_or(0);
                         let deadline = state.set_rate_limit_gate(secs);
@@ -2449,6 +2486,25 @@ async fn handle_ws_message(
                         // AUTH OK with accepted=false means auth was rejected.
                         warn!("mid-session AUTH rejected (event {event_id}): {message} — triggering reconnect");
                         return false;
+                    }
+                    // A refused EVENT is acknowledged on its own channel, so the
+                    // backoff must arm here — not only in the NOTICE arm. Without
+                    // this the harness would publish straight back into the same
+                    // quota it was just refused on.
+                    if !accepted && message.starts_with("rate-limited:") {
+                        let secs = parse_rate_limit_retry_secs(&message).unwrap_or(0);
+                        let deadline = state.set_rate_limit_gate(secs);
+                        // The OK names the refused frame, so re-park only that
+                        // one rather than every unacknowledged frame.
+                        state.requeue_rejected_observer_frame(&event_id);
+                        warn!(
+                            "rate-limit gate armed via OK for event {event_id} until ~{:.1}s from now",
+                            deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default()
+                                .as_secs_f64()
+                        );
+                        return true;
                     }
                     state.acknowledge_observer_frame(&event_id);
                     debug!("OK for event {event_id}: accepted={accepted} message={message}");
@@ -5910,6 +5966,151 @@ mod tests {
         assert_eq!(
             first_deadline, second_deadline,
             "shorter hint must not overwrite a later existing deadline"
+        );
+    }
+
+    /// A rate-limited `OK(id, false, …)` must arm the backoff gate and re-park
+    /// the refused frame, driven through the real frame dispatcher.
+    ///
+    /// This is the buzz-acp side of the relay's rejection-correlation change:
+    /// a refused EVENT is now acknowledged on its own channel instead of via
+    /// NOTICE. Reverting either the gate arming or the requeue in the `Ok` arm
+    /// must fail this test.
+    #[tokio::test]
+    async fn rate_limited_ok_arms_gate_and_reparks_refused_observer_frame() {
+        let (mut client, _server) = test_ws_pair().await;
+        let (event_tx, _event_rx) = mpsc::channel::<Option<BuzzEvent>>(4);
+        let (observer_control_tx, _observer_control_rx) = mpsc::channel::<Event>(4);
+        let keys = Keys::generate();
+        let mut state = BgState::new();
+
+        let refused = make_observer_frame(&keys);
+        let still_pending = make_observer_frame(&keys);
+        state.track_observer_in_flight(Box::new(refused.clone()));
+        state.track_observer_in_flight(Box::new(still_pending.clone()));
+        assert!(
+            state.check_rate_gate().is_none(),
+            "gate must start disarmed"
+        );
+
+        let frame = json!([
+            "OK",
+            refused.id.to_hex(),
+            false,
+            "rate-limited: retry in 5s"
+        ]);
+        let should_continue = handle_ws_message(
+            Message::Text(frame.to_string().into()),
+            &mut client,
+            &event_tx,
+            &observer_control_tx,
+            &mut state,
+            &keys,
+            "wss://relay.test",
+            "agent-pubkey",
+            None,
+        )
+        .await;
+
+        assert!(should_continue, "a rate-limited OK must keep the socket");
+        assert!(
+            state.check_rate_gate().is_some(),
+            "a rate-limited OK must arm the backoff gate, or the harness \
+             republishes straight into the same quota"
+        );
+        let parked: Vec<_> = state
+            .gated_observer_pending
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(
+            parked,
+            [refused.id],
+            "the refused frame must be re-parked for redelivery, not dropped"
+        );
+        let in_flight: Vec<_> = state
+            .observer_in_flight
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(
+            in_flight,
+            [still_pending.id],
+            "frames still awaiting their own verdict must stay in flight"
+        );
+    }
+
+    #[test]
+    fn rejected_observer_frame_displaces_oldest_parked_frame_at_capacity() {
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        let refused = make_observer_frame(&keys);
+        state.track_observer_in_flight(Box::new(refused.clone()));
+
+        let oldest = make_observer_frame(&keys);
+        state.park_gated_observer_frame(Box::new(oldest.clone()));
+        let mut survivors = Vec::with_capacity(GATED_OBSERVER_QUEUE_CAP - 1);
+        for _ in 1..GATED_OBSERVER_QUEUE_CAP {
+            let event = make_observer_frame(&keys);
+            survivors.push(event.id);
+            state.park_gated_observer_frame(Box::new(event));
+        }
+
+        state.requeue_rejected_observer_frame(&refused.id.to_hex());
+
+        let parked: Vec<_> = state
+            .gated_observer_pending
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        assert_eq!(parked.len(), GATED_OBSERVER_QUEUE_CAP);
+        assert_eq!(parked.first(), Some(&refused.id));
+        assert_eq!(&parked[1..], survivors.as_slice());
+        assert!(!parked.contains(&oldest.id));
+        assert_eq!(state.gated_observer_dropped, 1);
+        assert!(state.observer_in_flight.is_empty());
+    }
+
+    /// A non-rate-limit refusal is terminal: retrying would be refused
+    /// identically, so the frame is retired rather than re-parked, and the
+    /// backoff gate stays disarmed.
+    #[tokio::test]
+    async fn non_rate_limited_ok_rejection_retires_frame_without_arming_gate() {
+        let (mut client, _server) = test_ws_pair().await;
+        let (event_tx, _event_rx) = mpsc::channel::<Option<BuzzEvent>>(4);
+        let (observer_control_tx, _observer_control_rx) = mpsc::channel::<Event>(4);
+        let keys = Keys::generate();
+        let mut state = BgState::new();
+
+        let refused = make_observer_frame(&keys);
+        state.track_observer_in_flight(Box::new(refused.clone()));
+
+        let frame = json!(["OK", refused.id.to_hex(), false, "invalid: bad signature"]);
+        let should_continue = handle_ws_message(
+            Message::Text(frame.to_string().into()),
+            &mut client,
+            &event_tx,
+            &observer_control_tx,
+            &mut state,
+            &keys,
+            "wss://relay.test",
+            "agent-pubkey",
+            None,
+        )
+        .await;
+
+        assert!(should_continue, "a rejected event must not drop the socket");
+        assert!(
+            state.check_rate_gate().is_none(),
+            "only a rate-limit refusal arms the backoff gate"
+        );
+        assert!(
+            state.gated_observer_pending.is_empty(),
+            "a permanently refused frame must not be requeued into a retry loop"
+        );
+        assert!(
+            state.observer_in_flight.is_empty(),
+            "a permanently refused frame must be retired from the window"
         );
     }
 
