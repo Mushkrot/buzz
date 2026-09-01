@@ -51,6 +51,33 @@ access information.
 
 ---
 
+## Fork contribution boundary
+
+When this checkout is used as a fork, every requested change must be classified
+before implementation. The owner can describe the desired result in ordinary
+language; the agent proposes the boundary and explains it briefly.
+
+- **UPSTREAM** — a neutral bug fix, accessibility improvement, performance fix,
+  or generally useful UI/behavior change that does not depend on our private
+  environment or product identity.
+- **FORK** — behavior, defaults, branding, agent roles, infrastructure, or
+  workflows specific to our product and environment.
+- **SPLIT** — a reusable mechanism belongs upstream while our policy, defaults,
+  or product layer stays in the fork.
+- **DECISION** — the boundary is genuinely unclear or has a material product,
+  privacy, security, or publication consequence; ask the owner before coding.
+
+For an upstream contribution, start from `upstream/main` and keep the branch
+focused on the proposed change. For fork work, use the fork's product branch.
+Never use a mixed fork branch as the source of an upstream pull request. Before
+opening one, inspect `git diff upstream/main...HEAD` and confirm that it contains
+no fork-only behavior, private data, credentials, or environment details.
+
+An upstream pull request is never sent automatically. It requires an explicit
+owner decision after the change, tests, and user-visible verification are ready.
+
+---
+
 ## Repo Structure
 
 ```
