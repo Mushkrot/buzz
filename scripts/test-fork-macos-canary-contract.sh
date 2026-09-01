@@ -15,6 +15,7 @@ grep -Fq 'retention-days: 1' "$workflow"
 grep -Fq '"createUpdaterArtifacts": false' "$workflow"
 grep -Fq 'signature=unsigned' "$workflow"
 grep -Fq 'feature_set=default' "$workflow"
+grep -Fq '(cd "$STAGE_DIR" && shasum -a 256 "$NAME"' "$workflow"
 grep -Fq 'rm -rf --' "$workflow"
 
 if [[ $(grep -Fc 'uses: actions/upload-artifact@' "$workflow") -ne 1 ]]; then

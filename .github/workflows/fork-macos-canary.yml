@@ -134,7 +134,7 @@ jobs:
           mkdir -p "$STAGE_DIR"
           NAME="Buzz_${VERSION}_aarch64.dmg"
           cp "$DMG" "$STAGE_DIR/$NAME"
-          shasum -a 256 "$STAGE_DIR/$NAME" > "$STAGE_DIR/$NAME.sha256"
+          (cd "$STAGE_DIR" && shasum -a 256 "$NAME" > "$NAME.sha256")
           cat > "$STAGE_DIR/build-info.txt" <<EOF
           repository=${GITHUB_REPOSITORY}
           ref=${GITHUB_REF}
