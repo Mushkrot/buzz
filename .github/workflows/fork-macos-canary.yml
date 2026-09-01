@@ -116,14 +116,14 @@ jobs:
         run: |
           set -euo pipefail
           BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle/dmg"
-          mapfile -t DMGS < <(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.dmg' -print)
-          if [[ ${#DMGS[@]} -ne 1 ]]; then
-            echo "::error::Expected exactly one DMG in $BUNDLE_DIR, found ${#DMGS[@]}"
-            printf '%s\n' "${DMGS[@]}"
+          DMG_COUNT=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.dmg' -print | wc -l | tr -d ' ')
+          if [[ "$DMG_COUNT" != "1" ]]; then
+            echo "::error::Expected exactly one DMG in $BUNDLE_DIR, found $DMG_COUNT"
+            find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.dmg' -print
             exit 1
           fi
 
-          DMG="${DMGS[0]}"
+          DMG=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.dmg' -print -quit)
           BYTES=$(stat -f '%z' "$DMG")
           if (( BYTES <= 0 || BYTES > MAX_DMG_BYTES )); then
             echo "::error::DMG size ${BYTES} bytes is outside the 1..${MAX_DMG_BYTES} byte policy"

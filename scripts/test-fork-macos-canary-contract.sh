@@ -34,6 +34,11 @@ if grep -Eq 'retention-days:[[:space:]]*[2-9][0-9]*|macos-[0-9]+|macos-.*(large|
   exit 1
 fi
 
+if grep -Fq 'mapfile' "$workflow"; then
+  echo "fork canary must remain compatible with macOS's system Bash 3.2" >&2
+  exit 1
+fi
+
 on_block=$(
   awk '
     /^on:$/ { in_on = 1; next }
