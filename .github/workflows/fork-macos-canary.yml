@@ -1,0 +1,169 @@
+name: Fork macOS ARM64 Canary
+run-name: Fork macOS ARM64 canary · ${{ github.ref_name }}
+
+# This is the fork-only build lane for Apple Silicon Macs (including the M4).
+# It deliberately produces one short-lived Actions artifact and never creates
+# a GitHub Release, updater metadata, package, or Actions cache entry.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: fork-macos-arm64-canary
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned macOS ARM64 canary
+    if: github.repository == 'Mushkrot/buzz'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+      MAX_DMG_BYTES: "314572800"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      # Fail before the expensive build if this workflow ever drifts toward
+      # persistent caches, releases, or a second platform artifact.
+      - name: Verify zero-storage build contract
+        run: ./scripts/test-fork-macos-canary-contract.sh
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Derive canary version
+        id: version
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(node -p "require('./desktop/package.json').version")
+          if [[ "$BASE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-fork.${GITHUB_RUN_NUMBER}"
+          else
+            echo "::error::Desktop version '$BASE_VERSION' is not semver"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building canary version $VERSION from $GITHUB_SHA"
+
+      - name: Patch canary version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd desktop
+          node scripts/set-version-from-tag.mjs "$VERSION"
+          cd src-tauri
+          cargo update --workspace
+
+      - name: Generate non-updating bundle config
+        run: |
+          cat > desktop/src-tauri/tauri.canary.conf.json <<'JSON'
+          {
+            "bundle": {
+              "createUpdaterArtifacts": false,
+              "macOS": {
+                "minimumSystemVersion": "10.15"
+              }
+            }
+          }
+          JSON
+
+      - name: Build ARM64 sidecars
+        run: |
+          cargo build --release --target "$TARGET" \
+            -p buzz-acp \
+            -p buzz-agent \
+            -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp \
+            -p git-credential-nostr \
+            -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      # The default feature set keeps this zero-storage canary focused on the
+      # desktop client. Mesh-LLM is a separate, opt-in build concern because
+      # its native runtime is large and needs its own reviewed workflow.
+      - name: Build unsigned ARM64 DMG
+        run: >-
+          cd desktop && pnpm tauri build --verbose --no-sign
+          --target "$TARGET" --bundles dmg
+          --config src-tauri/tauri.canary.conf.json
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+
+      - name: Stage canary artifact
+        id: artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle/dmg"
+          mapfile -t DMGS < <(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.dmg' -print)
+          if [[ ${#DMGS[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one DMG in $BUNDLE_DIR, found ${#DMGS[@]}"
+            printf '%s\n' "${DMGS[@]}"
+            exit 1
+          fi
+
+          DMG="${DMGS[0]}"
+          BYTES=$(stat -f '%z' "$DMG")
+          if (( BYTES <= 0 || BYTES > MAX_DMG_BYTES )); then
+            echo "::error::DMG size ${BYTES} bytes is outside the 1..${MAX_DMG_BYTES} byte policy"
+            exit 1
+          fi
+
+          STAGE_DIR="$RUNNER_TEMP/buzz-macos-arm64-canary"
+          mkdir -p "$STAGE_DIR"
+          NAME="Buzz_${VERSION}_aarch64.dmg"
+          cp "$DMG" "$STAGE_DIR/$NAME"
+          shasum -a 256 "$STAGE_DIR/$NAME" > "$STAGE_DIR/$NAME.sha256"
+          cat > "$STAGE_DIR/build-info.txt" <<EOF
+          repository=${GITHUB_REPOSITORY}
+          ref=${GITHUB_REF}
+          commit=${GITHUB_SHA}
+          target=${TARGET}
+          workflow_run=${GITHUB_RUN_ID}
+          feature_set=default
+          signature=unsigned
+          artifact_retention_days=1
+          EOF
+
+          echo "directory=$STAGE_DIR" >> "$GITHUB_OUTPUT"
+          echo "DMG: $NAME ($BYTES bytes)"
+
+      - name: Upload one short-lived canary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-macos-arm64-canary-${{ github.run_id }}
+          path: ${{ steps.artifact.outputs.directory }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # GitHub-hosted runners are ephemeral, but remove the known build trees
+      # explicitly so a failed job also leaves no reusable local payload.
+      - name: Remove build workspace
+        if: always()
+        run: |
+          rm -rf -- \
+            "$GITHUB_WORKSPACE/target" \
+            "$GITHUB_WORKSPACE/desktop/src-tauri/target" \
+            "$GITHUB_WORKSPACE/node_modules" \
+            "$GITHUB_WORKSPACE/desktop/node_modules"

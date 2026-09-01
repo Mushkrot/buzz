@@ -166,6 +166,22 @@ gh run download <run-id> --repo block/buzz --name <artifact-name>
 The workflow intentionally accepts only `main`. Use the normal release process
 for distributable builds or builds from an immutable release tag.
 
+### Fork macOS test builds
+
+The `Mushkrot/buzz` fork does not use the signed upstream canary for its own
+iterations. Use the manual **Fork macOS ARM64 Canary** workflow and select the
+exact fork branch or tag to build:
+
+```sh
+gh workflow run fork-macos-canary.yml --repo Mushkrot/buzz --ref main
+```
+
+This lane is deliberately storage-bounded: it uses a standard public macOS
+runner, no Actions Cache, one unsigned ARM64 DMG, a checksum and provenance
+text, and one-day artifact retention. It never creates a GitHub Release or
+updater metadata. The complete rules and the post-run storage check are in
+[`docs/FORK_BUILD_POLICY.md`](docs/FORK_BUILD_POLICY.md).
+
 ---
 
 ## Release Retry
