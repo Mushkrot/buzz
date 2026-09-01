@@ -178,6 +178,210 @@ pub fn read_or_stdin(value: &str) -> Result<String, CliError> {
     }
 }
 
+/// Read Markdown from argv or stdin, normalizing only structural escaped
+/// newlines in argv content.
+///
+/// Stdin is the byte-exact path. It is already the documented way to publish
+/// content that contains intentional backslashes, code, or arbitrary prose.
+/// The argv path repairs the narrow pattern produced when a JSON-escaped
+/// multiline body is passed through shell quoting: `\\n\\n`, `\\n- `, and
+/// similar Markdown block boundaries. Isolated `\\n` remains unchanged.
+pub fn read_markdown_or_stdin(value: &str) -> Result<String, CliError> {
+    let from_stdin = value == "-";
+    let content = read_or_stdin(value)?;
+    if from_stdin {
+        Ok(content)
+    } else {
+        Ok(decode_argv_multiline_escapes(&content))
+    }
+}
+
+/// Decode JSON-style `\\n` escapes at Markdown paragraph and block boundaries.
+///
+/// This is intentionally not a general unescape operation. Literal backslashes
+/// are valid in code, paths, prose, and JSON, so only an unescaped sequence at
+/// a likely Markdown boundary is changed. Fenced and inline code are tracked
+/// while scanning, including fences whose line breaks are themselves escaped.
+/// Real LF bytes are copied unchanged.
+pub fn decode_argv_multiline_escapes(content: &str) -> String {
+    let bytes = content.as_bytes();
+    if !bytes.windows(2).any(|window| window == b"\\n") {
+        return content.to_string();
+    }
+
+    let mut output = String::with_capacity(content.len());
+    let mut line_start = true;
+    let mut fence_len: Option<usize> = None;
+    let mut inline_ticks: Option<usize> = None;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if let Some(required_fence_len) = fence_len {
+            if line_start && bytes[index] == b'`' {
+                let run_len = backtick_run(bytes, index);
+                if run_len >= required_fence_len {
+                    output.push_str(&content[index..index + run_len]);
+                    index += run_len;
+                    line_start = false;
+                    fence_len = None;
+                    continue;
+                }
+            }
+
+            // Keep code bytes unchanged, but treat the escaped sequence as a
+            // logical line break so a following closing fence can be found.
+            if is_backslash_n(bytes, index) {
+                output.push_str(&content[index..index + 2]);
+                index += 2;
+                line_start = true;
+                continue;
+            }
+        } else if let Some(required_ticks) = inline_ticks {
+            if bytes[index] == b'`' {
+                let run_len = backtick_run(bytes, index);
+                if run_len == required_ticks {
+                    output.push_str(&content[index..index + run_len]);
+                    index += run_len;
+                    line_start = false;
+                    inline_ticks = None;
+                    continue;
+                }
+            }
+        } else {
+            if bytes[index] == b'`' {
+                let run_len = backtick_run(bytes, index);
+                if line_start && run_len >= 3 {
+                    output.push_str(&content[index..index + run_len]);
+                    index += run_len;
+                    line_start = false;
+                    fence_len = Some(run_len);
+                    continue;
+                }
+                if has_inline_closing_delimiter(bytes, index + run_len, run_len) {
+                    output.push_str(&content[index..index + run_len]);
+                    index += run_len;
+                    line_start = false;
+                    inline_ticks = Some(run_len);
+                    continue;
+                }
+            }
+
+            if is_structural_escaped_newline(bytes, index) {
+                output.push('\n');
+                index += 2;
+                line_start = true;
+                continue;
+            }
+        }
+
+        let Some(ch) = content[index..].chars().next() else {
+            break;
+        };
+        output.push(ch);
+        index += ch.len_utf8();
+        if ch == '\n' {
+            line_start = true;
+        } else if !(line_start && ch.is_ascii_whitespace()) {
+            line_start = false;
+        }
+    }
+
+    output
+}
+
+fn is_backslash_n(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index..index + 2) == Some(b"\\n")
+}
+
+fn backtick_run(bytes: &[u8], mut index: usize) -> usize {
+    let start = index;
+    while bytes.get(index) == Some(&b'`') {
+        index += 1;
+    }
+    index - start
+}
+
+fn has_inline_closing_delimiter(bytes: &[u8], mut index: usize, required_len: usize) -> bool {
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            return false;
+        }
+        if bytes[index] == b'`' {
+            let run_len = backtick_run(bytes, index);
+            if run_len == required_len {
+                return true;
+            }
+            index += run_len;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn is_structural_escaped_newline(bytes: &[u8], index: usize) -> bool {
+    if !is_backslash_n(bytes, index) || has_odd_preceding_backslashes(bytes, index) {
+        return false;
+    }
+
+    let rest = &bytes[index + 2..];
+    if rest.starts_with(b"\\n") || escaped_line_starts_block(rest) {
+        return true;
+    }
+
+    // The second half of `\\n\\n` is a paragraph break even when ordinary
+    // text follows it instead of a list or heading marker.
+    index >= 2 && bytes[index - 2..index] == *b"\\n"
+}
+
+fn has_odd_preceding_backslashes(bytes: &[u8], index: usize) -> bool {
+    let mut count = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        count += 1;
+        cursor -= 1;
+    }
+    count % 2 == 1
+}
+
+fn escaped_line_starts_block(rest: &[u8]) -> bool {
+    let mut index = 0;
+    while index < rest.len() && matches!(rest[index], b' ' | b'\t') {
+        index += 1;
+        if index > 3 {
+            return false;
+        }
+    }
+    let rest = &rest[index..];
+
+    if rest.starts_with(b"- ") || rest.starts_with(b"* ") || rest.starts_with(b"+ ") {
+        return true;
+    }
+    if rest.starts_with(b"> ") || rest.starts_with(b"```") {
+        return true;
+    }
+    if heading_marker_len(rest).is_some() || ordered_list_marker_len(rest).is_some() {
+        return true;
+    }
+    false
+}
+
+fn heading_marker_len(bytes: &[u8]) -> Option<usize> {
+    let mut length = 0;
+    while length < bytes.len() && length < 6 && bytes[length] == b'#' {
+        length += 1;
+    }
+    (length > 0 && bytes.get(length) == Some(&b' ')).then_some(length)
+}
+
+fn ordered_list_marker_len(bytes: &[u8]) -> Option<usize> {
+    let mut length = 0;
+    while length < bytes.len() && bytes[length].is_ascii_digit() {
+        length += 1;
+    }
+    (length > 0 && bytes.get(length..length + 2) == Some(b". ")).then_some(length)
+}
+
 /// Read content from a file path, or stdin if the value is "-".
 ///
 /// Unlike [`read_or_stdin`], `value` is never treated as literal content —
@@ -474,6 +678,65 @@ mod tests {
     #[test]
     fn read_or_stdin_passthrough_empty_string() {
         assert_eq!(super::read_or_stdin("").unwrap(), "");
+    }
+
+    // --- Markdown argv newline normalization ---
+
+    #[test]
+    fn argv_escaped_paragraph_and_list_sequences_become_real_newlines() {
+        let raw = r"First paragraph.\n\n- first item\n- second item";
+        let normalized = super::read_markdown_or_stdin(raw).unwrap();
+        assert_eq!(
+            normalized,
+            "First paragraph.\n\n- first item\n- second item"
+        );
+        assert!(!normalized.contains(r"\n"));
+    }
+
+    #[test]
+    fn argv_escaped_newline_before_plain_text_stays_literal() {
+        let raw = r"Path C:\new\tmp and the token \n in prose.";
+        assert_eq!(super::read_markdown_or_stdin(raw).unwrap(), raw);
+    }
+
+    #[test]
+    fn argv_escaped_sequences_inside_inline_code_stay_literal() {
+        let raw = r"Use `printf 'first\n\n- literal'` in this example.";
+        assert_eq!(super::read_markdown_or_stdin(raw).unwrap(), raw);
+    }
+
+    #[test]
+    fn argv_escaped_sequences_inside_fenced_code_stay_literal() {
+        let raw = r"Before\n```sh\nprintf 'first\n\n- literal'\n```\nAfter";
+        assert_eq!(
+            super::read_markdown_or_stdin(raw).unwrap(),
+            "Before\n```sh\\nprintf 'first\\n\\n- literal'\\n```\\nAfter",
+            "code fences and their contents must remain byte-exact"
+        );
+    }
+
+    #[test]
+    fn argv_escaped_backslash_before_n_stays_literal() {
+        let raw = r"The literal sequence \\n\n- item";
+        assert_eq!(
+            super::read_markdown_or_stdin(raw).unwrap(),
+            "The literal sequence \\\\n\n- item"
+        );
+    }
+
+    #[test]
+    fn argv_escaped_structural_markers_decode() {
+        let raw = r"Intro.\n\n1. first\n2. second\n\n> quote\n\n# Heading";
+        assert_eq!(
+            super::read_markdown_or_stdin(raw).unwrap(),
+            "Intro.\n\n1. first\n2. second\n\n> quote\n\n# Heading"
+        );
+    }
+
+    #[test]
+    fn argv_real_newlines_are_unchanged() {
+        let content = "First paragraph.\n\n- first item\n- second item";
+        assert_eq!(super::read_markdown_or_stdin(content).unwrap(), content);
     }
 
     // --- read_file_or_stdin ---
