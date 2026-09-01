@@ -104,6 +104,18 @@ cargo clippy -p buzz-cli -- -D warnings
 # Expected: zero warnings
 ```
 
+### Multiline content regression
+
+The focused regression tests cover escaped paragraph and list breaks, literal
+backslashes, inline and fenced code, and already-real newline bytes:
+
+```bash
+cargo test -p buzz-cli argv_
+```
+
+The argv path may normalize only recognizable Markdown boundaries. The
+`--content -` stdin path must remain byte-exact.
+
 ---
 
 ## 6. Live Testing — Command by Command

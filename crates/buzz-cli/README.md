@@ -100,6 +100,26 @@ buzz channels list | jq '.[].name'
 constraint omitted from the command is removed. `protect list` reports malformed
 stored rules in `validation_error` so an owner can remove and repair them.
 
+### Multiline Markdown content
+
+For the most predictable result, pass multiline content through stdin with
+`--content -`; stdin is preserved byte-for-byte:
+
+```bash
+cat <<'EOF' | buzz messages send --channel <uuid> --content -
+First paragraph.
+
+- first item
+- second item
+EOF
+```
+
+When content must be supplied as an argument, the CLI repairs JSON-style `\n`
+sequences only at recognizable Markdown paragraph, list, quote, or heading
+boundaries. Literal backslashes in prose, paths, inline code, and fenced code
+remain unchanged. For example, `--content 'First paragraph.\n\n- first item'`
+produces the same Markdown layout as the stdin form.
+
 ## Commands
 
 | Group | Subcommand | Description |
