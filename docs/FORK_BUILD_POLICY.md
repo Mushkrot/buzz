@@ -43,6 +43,16 @@ has no cache and keeps the sole artifact small and short-lived. “Free” still
 requires monitoring the repository's total Actions storage if other workflows
 are changed later.
 
+## Fork Actions setting
+
+Actions is enabled at the repository level only so the manual fork canary can
+run. All inherited upstream workflows are disabled in the fork's GitHub
+settings; **Fork macOS ARM64 Canary** is the only active workflow. This matters
+because an upstream `main` push can otherwise start CI, Docker, Sprig, or Helm
+jobs that save caches and artifacts even though they are unrelated to our Mac
+build. Re-enable another workflow only after reviewing its runner, cache,
+artifact, and publishing behavior.
+
 ## Before and after a run
 
 Run the policy check locally before changing the workflow:
