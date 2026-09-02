@@ -1611,6 +1611,26 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
       .getByTestId("user-profile-agent-status")
       .locator('[data-slot="profile-field-icon"]'),
   ).toHaveCount(1);
+  const executionSection = page.getByTestId("user-profile-execution-section");
+  await expect(executionSection).toBeVisible();
+  await expect(
+    executionSection.getByTestId("user-profile-execution-location"),
+  ).toContainText("This computer");
+  await expect(
+    executionSection.getByTestId("user-profile-execution-harness"),
+  ).toContainText("buzz-agent");
+  await expect(
+    executionSection.getByTestId("user-profile-execution-provider"),
+  ).toHaveCount(0);
+  await expect(
+    executionSection.getByTestId("user-profile-execution-model"),
+  ).toHaveCount(0);
+  await executionSection.getByTestId("user-profile-execution-edit").click();
+  await expect(page.getByTestId("persona-dialog")).toBeVisible();
+  await page
+    .getByTestId("persona-dialog")
+    .getByRole("button", { name: "Cancel" })
+    .click();
   await expect(
     page.getByTestId("user-profile-model-settings-section"),
   ).toBeVisible();
@@ -1704,6 +1724,7 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   ).toHaveCount(0);
   const runtimeSectionHeaderOffsets = await Promise.all(
     [
+      executionSection,
       page.getByTestId("user-profile-runtime-activity-section"),
       page.getByTestId("user-profile-agent-configuration-section"),
       page.getByTestId("user-profile-model-settings-section"),
