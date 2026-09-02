@@ -181,7 +181,7 @@ export function buildMentionCandidates({
         (activePersonaById.has(pubkey) ? pubkey : undefined),
       ownerPubkey: agent.ownerPubkey,
       isAgent: true,
-      isActiveAgent: agent.status !== "offline",
+      isActiveAgent: agent.status === "online" || agent.status === "away",
     });
   }
   for (const agent of managedAgents ?? []) {

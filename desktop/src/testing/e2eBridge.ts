@@ -900,7 +900,7 @@ type RawRelayAgent = {
   channels: string[];
   channel_ids: string[];
   capabilities: string[];
-  status: PresenceStatus;
+  status: PresenceStatus | "unknown";
   respond_to?: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist?: string[];
 };
