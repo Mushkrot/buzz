@@ -1169,6 +1169,7 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   await expect(page.getByTestId("user-profile-message")).toBeVisible();
   await expect(page.getByTestId("user-profile-huddle")).toHaveCount(0);
   await expect(page.getByTestId("user-profile-wave")).toHaveCount(0);
+  await expectHashSearchParam(page, "profile", agentPubkey);
   const agentPresenceBadge = page.getByTestId("user-profile-presence-badge");
   await expect(agentPresenceBadge).toBeVisible();
   await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Online");
@@ -1234,6 +1235,7 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   await agentPrimaryAction.click();
   await expect(agentPrimaryAction).toHaveAttribute("aria-label", "Start agent");
   await expect(agentPresenceBadge).toHaveAttribute("aria-label", "Offline");
+  await expectHashSearchParam(page, "profile", agentPubkey);
   await expect(agentPrimaryAction).toHaveClass(/bg-foreground/);
   await expect(agentPrimaryAction).toHaveClass(/text-background/);
   await expect(page.getByTestId("user-profile-agent-restart")).toHaveCount(0);
@@ -1855,9 +1857,9 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   await expect(page.getByTestId("agent-memory-list")).toContainText("orphan");
 });
 
-test("an older agent message opens the same persona instance as the Agents library", async ({
+test("an older agent message stays exact while persona navigation selects the live instance", async ({
   page,
-}) => {
+}, testInfo) => {
   const personaId = "profile-parity-agent";
   const historicalPubkey = TEST_IDENTITIES.charlie.pubkey;
   const currentPubkey = "d".repeat(64);
@@ -1896,7 +1898,6 @@ test("an older agent message opens the same persona instance as the Agents libra
   await expect(
     page.getByTestId("user-profile-agent-primary-action"),
   ).toHaveAttribute("aria-label", "Stop");
-  const agentsLibraryContract = await readOwnedAgentProfileContract(page);
 
   await page.getByTestId("user-profile-tab-runtime").click();
   await page.getByTestId("user-profile-instances").click();
@@ -1910,6 +1911,8 @@ test("an older agent message opens the same persona instance as the Agents libra
     page.getByTestId(`user-profile-instance-${historicalPubkey}`),
   ).toContainText("Current");
 
+  const exactInstanceContract = await readOwnedAgentProfileContract(page);
+
   await page.getByTestId("auxiliary-panel-close").click();
   await page.getByTestId("channel-agents").click();
   const historicalMessage = page
@@ -1919,10 +1922,15 @@ test("an older agent message opens the same persona instance as the Agents libra
   await historicalMessage.locator("button").first().click();
   await expect(
     page.getByTestId("user-profile-agent-primary-action"),
-  ).toHaveAttribute("aria-label", "Stop");
+  ).toHaveAttribute("aria-label", "Start agent");
   const messageContract = await readOwnedAgentProfileContract(page);
 
-  expect(messageContract).toEqual(agentsLibraryContract);
+  expect(messageContract).toEqual(exactInstanceContract);
+  await page.getByTestId("user-profile-tab-info").click();
+  await waitForAnimations(page);
+  await page.screenshot({
+    path: testInfo.outputPath("historical-exact-instance.png"),
+  });
 });
 
 test("restored Inbox deep link hides the back arrow", async ({ page }) => {
