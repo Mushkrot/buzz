@@ -1270,7 +1270,7 @@ mod tests {
         assert!(!ledger_removal.contains("'authorization_operation_receipts'"));
         assert!(!ledger_removal.contains("'identity_bindings'"));
         assert!(
-            desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[]),"),
+            desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
             "schema.sql exclusion list must match the pre-0041 body after ledger removal"
         );
     }
