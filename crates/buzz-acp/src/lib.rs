@@ -325,14 +325,10 @@ fn effective_prompt_author(
 /// way to obtain one is [`InboundAuthorGate::connect`], which loads the
 /// identity.
 ///
-/// Two earlier revisions of this code were mutable-with-impunity: the first
-/// threaded a local `Option<String>` into every gate call, and the second kept
-/// a free `evaluate_inbound_author_gate(.., relay_self, ..)` alongside the
-/// method. In both cases a listener could be rewired to pass `None` — silently
-/// disabling every delegated workflow wake — while all 848 tests stayed green.
-/// Encapsulation, not a test, is what closes that seam: `InboundAuthorGate {
-/// relay_self: None, .. }` is now a privacy error outside this module, and
-/// dropping the load inside it fails the construction regressions.
+/// Keeping the identity in a private gate prevents listener code from bypassing
+/// relay verification or silently disabling delegated workflow wakes. The gate
+/// is constructed through [`InboundAuthorGate::connect`], which loads the
+/// relay identity and owns refresh and transient-error handling.
 mod inbound_author_gate {
     use super::{
         effective_prompt_author, is_dm_channel, is_owner_or_sibling, pool, refresh_relay_self,
