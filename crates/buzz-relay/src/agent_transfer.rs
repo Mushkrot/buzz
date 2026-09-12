@@ -5,7 +5,7 @@
 //! and delegates state changes to `buzz-db`. It does not start processes,
 //! copy keys, or treat a text response as proof that a runtime is quiescent.
 
-use buzz_core::agent_transfer::{TransferCommand, TransferRecord};
+use buzz_core::agent_transfer::{TransferExecutorCommand, TransferRecord, WireError};
 use buzz_core::CommunityId;
 use buzz_db::managed_agent_transfers::{
     CreateManagedAgentTransferResult, ManagedAgentTransferJournalEntry,
@@ -28,6 +28,9 @@ pub enum TransferCoordinatorError {
     /// The executor identity does not match the current fenced authority.
     #[error("executor does not hold the current transfer authority")]
     ExecutorMismatch,
+    /// The wire command failed structural validation before the database CAS.
+    #[error("invalid transfer executor command: {0}")]
+    InvalidCommand(#[from] WireError),
 }
 
 /// Durable relay coordinator for one or more managed-agent transfers.
@@ -37,21 +40,11 @@ pub struct TransferCoordinator {
 }
 
 /// Fenced command envelope reported by one executor instance.
-#[derive(Debug, Clone)]
-pub struct ExecutorCommandRequest {
-    /// Agent identity being moved.
-    pub agent_pubkey: String,
-    /// Transfer operation id.
-    pub operation_id: String,
-    /// Instance claiming to hold the current authority.
-    pub executor_instance_id: String,
-    /// Revision observed by the executor.
-    pub expected_revision: u64,
-    /// Fencing epoch observed by the executor.
-    pub expected_epoch: u64,
-    /// State-machine command being reported.
-    pub command: TransferCommand,
-}
+///
+/// This alias keeps the relay coordinator and the encrypted Nostr/WebSocket
+/// payload on one JSON contract instead of maintaining two subtly different
+/// request shapes.
+pub type ExecutorCommandRequest = TransferExecutorCommand;
 
 impl TransferCoordinator {
     /// Construct a coordinator over the relay's authoritative database handle.
@@ -120,6 +113,7 @@ impl TransferCoordinator {
         community_id: CommunityId,
         request: ExecutorCommandRequest,
     ) -> Result<TransferRecord, TransferCoordinatorError> {
+        request.validate()?;
         let agent_pubkey = canonical_agent_pubkey(&request.agent_pubkey)?;
         let agent_pubkey_hex = hex::encode(agent_pubkey);
         let current = self

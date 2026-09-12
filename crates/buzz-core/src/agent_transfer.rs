@@ -11,6 +11,7 @@ use thiserror::Error;
 /// Version of the transfer state-machine contract.
 pub const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 const MAX_REASON_BYTES: usize = 512;
+const MAX_MESSAGE_ID_BYTES: usize = 128;
 
 /// A concrete executor location participating in a transfer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +292,273 @@ impl TransferCommand {
     }
 }
 
+/// A request sent through the existing encrypted observer-frame transport.
+///
+/// The relay still authenticates the signed Nostr event and its `p`/`agent`
+/// routing tags. These payload types only define the transfer-specific JSON
+/// carried inside the already encrypted frame; they do not grant authority by
+/// themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "message",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum TransferWireMessage {
+    /// A request made by the managed-agent owner.
+    OwnerRequest {
+        /// Owner request body.
+        request: TransferOwnerRequest,
+    },
+    /// A state-machine command reported by the executor holding authority.
+    ExecutorCommand {
+        /// Executor command body.
+        command: TransferExecutorCommand,
+    },
+    /// A response to either request type.
+    Response {
+        /// Response body.
+        response: TransferWireResponse,
+    },
+}
+
+impl TransferWireMessage {
+    fn validate(&self) -> Result<(), WireError> {
+        match self {
+            Self::OwnerRequest { request } => request.validate(),
+            Self::ExecutorCommand { command } => command.validate(),
+            Self::Response { response } => response.validate(),
+        }
+    }
+}
+
+/// Versioned, correlated envelope for the transfer payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferWireEnvelope {
+    /// Transfer wire protocol version.
+    pub protocol_version: u32,
+    /// Caller-chosen correlation id, not an authority or idempotency key.
+    pub message_id: String,
+    /// Typed transfer request or response.
+    pub message: TransferWireMessage,
+}
+
+impl TransferWireEnvelope {
+    /// Construct and validate a version-1 envelope.
+    pub fn new(
+        message_id: impl Into<String>,
+        message: TransferWireMessage,
+    ) -> Result<Self, WireError> {
+        let envelope = Self {
+            protocol_version: TRANSFER_PROTOCOL_VERSION,
+            message_id: message_id.into(),
+            message,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Validate the envelope before handing it to a relay or runtime adapter.
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.protocol_version != TRANSFER_PROTOCOL_VERSION {
+            return Err(WireError::UnsupportedProtocol(self.protocol_version));
+        }
+        if self.message_id.is_empty()
+            || self.message_id.len() > MAX_MESSAGE_ID_BYTES
+            || self.message_id.chars().any(char::is_control)
+        {
+            return Err(WireError::InvalidMessageId);
+        }
+        self.message.validate()
+    }
+
+    /// Serialize and validate a transfer message as JSON.
+    pub fn to_json(&self) -> Result<String, WireError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|error| WireError::Json(error.to_string()))
+    }
+
+    /// Parse and validate a transfer message from JSON.
+    pub fn from_json(value: &str) -> Result<Self, WireError> {
+        let envelope: Self =
+            serde_json::from_str(value).map_err(|error| WireError::Json(error.to_string()))?;
+        envelope.validate()?;
+        Ok(envelope)
+    }
+}
+
+/// Owner-facing transfer requests supported by protocol version 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransferOwnerRequest {
+    /// Start or idempotently recover the supplied transfer operation.
+    Start {
+        /// Public, secret-free transfer snapshot to persist.
+        transfer: Box<TransferRecord>,
+    },
+    /// Read the current state for an agent.
+    Status {
+        /// Canonical lowercase 32-byte agent public key.
+        agent_pubkey: String,
+    },
+}
+
+impl TransferOwnerRequest {
+    fn validate(&self) -> Result<(), WireError> {
+        match self {
+            Self::Start { transfer } => transfer.validate().map_err(WireError::State),
+            Self::Status { agent_pubkey } => validate_agent_pubkey(agent_pubkey),
+        }
+    }
+}
+
+/// Executor command envelope for one fenced transfer operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferExecutorCommand {
+    /// Agent identity being moved.
+    pub agent_pubkey: String,
+    /// Transfer operation id.
+    pub operation_id: String,
+    /// Instance claiming to hold the current authority.
+    pub executor_instance_id: String,
+    /// Revision observed by the executor.
+    pub expected_revision: u64,
+    /// Fencing epoch observed by the executor.
+    pub expected_epoch: u64,
+    /// State-machine command being reported.
+    pub command: TransferCommand,
+}
+
+impl TransferExecutorCommand {
+    /// Validate identifiers before the relay performs its database CAS.
+    pub fn validate(&self) -> Result<(), WireError> {
+        validate_agent_pubkey(&self.agent_pubkey)?;
+        validate_identifier("operation_id", &self.operation_id).map_err(WireError::State)?;
+        validate_identifier("executor_instance_id", &self.executor_instance_id)
+            .map_err(WireError::State)?;
+        Ok(())
+    }
+}
+
+/// Response returned after a transfer request or fenced command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransferWireResponse {
+    /// A start request was accepted or replayed idempotently.
+    Accepted {
+        /// Current durable state.
+        transfer: Box<TransferRecord>,
+    },
+    /// A status request result. `None` means no transfer exists yet.
+    Status {
+        /// Current durable state, if present.
+        transfer: Option<Box<TransferRecord>>,
+    },
+    /// An executor command was accepted.
+    Applied {
+        /// State after the accepted transition.
+        transfer: Box<TransferRecord>,
+    },
+    /// The request was rejected without changing durable state.
+    Rejected {
+        /// Bounded, non-secret rejection details.
+        error: TransferWireError,
+    },
+}
+
+impl TransferWireResponse {
+    fn validate(&self) -> Result<(), WireError> {
+        match self {
+            Self::Accepted { transfer } | Self::Applied { transfer } => {
+                transfer.validate().map_err(WireError::State)
+            }
+            Self::Status { transfer } => {
+                if let Some(record) = transfer {
+                    record.validate().map_err(WireError::State)?;
+                }
+                Ok(())
+            }
+            Self::Rejected { error } => error.validate(),
+        }
+    }
+}
+
+/// Safe error returned on the transfer wire. It never carries credentials or
+/// process output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferWireError {
+    /// Stable machine-readable category.
+    pub code: TransferWireErrorCode,
+    /// Short diagnostic safe for an owner-facing UI.
+    pub detail: String,
+}
+
+impl TransferWireError {
+    fn validate(&self) -> Result<(), WireError> {
+        if self.detail.is_empty()
+            || self.detail.len() > MAX_REASON_BYTES
+            || self.detail.chars().any(char::is_control)
+        {
+            return Err(WireError::InvalidDetail);
+        }
+        Ok(())
+    }
+}
+
+/// Stable rejection categories for transfer requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferWireErrorCode {
+    /// The signed caller is not the registered owner.
+    Unauthorized,
+    /// The request failed structural or state validation.
+    InvalidRequest,
+    /// The caller supplied a stale revision or fencing epoch.
+    StaleState,
+    /// The requested transfer cannot be performed in the current state.
+    Conflict,
+    /// The relay or runtime is temporarily unavailable.
+    Unavailable,
+}
+
+/// Errors raised while parsing or validating the transfer wire payload.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WireError {
+    /// JSON could not be decoded or encoded.
+    #[error("transfer wire JSON error: {0}")]
+    Json(String),
+    /// The state-machine snapshot inside the payload is invalid.
+    #[error("invalid transfer state: {0}")]
+    State(Error),
+    /// The agent key was not canonical lowercase 32-byte hex.
+    #[error("invalid transfer agent public key")]
+    InvalidAgentPubkey,
+    /// Wire protocol version is newer than this implementation understands.
+    #[error("unsupported transfer wire protocol version {0}")]
+    UnsupportedProtocol(u32),
+    /// Correlation id was empty, oversized, or contained control characters.
+    #[error("invalid transfer message id")]
+    InvalidMessageId,
+    /// A response detail was empty, oversized, or contained control characters.
+    #[error("invalid transfer response detail")]
+    InvalidDetail,
+}
+
+fn validate_agent_pubkey(value: &str) -> Result<(), WireError> {
+    let bytes = hex::decode(value).map_err(|_| WireError::InvalidAgentPubkey)?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WireError::InvalidAgentPubkey)?;
+    if hex::encode(key) != value {
+        return Err(WireError::InvalidAgentPubkey);
+    }
+    Ok(())
+}
+
 /// Errors returned before a state transition is committed.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Error {
@@ -549,5 +817,77 @@ mod tests {
             let decoded: TransferCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, original);
         }
+    }
+
+    fn wire_agent_pubkey() -> String {
+        "ab".repeat(32)
+    }
+
+    fn wire_record() -> TransferRecord {
+        TransferRecord::new(
+            "community-a",
+            wire_agent_pubkey(),
+            "operation-1",
+            Executor::new("mac-1", "Mac").unwrap(),
+            Executor::new("server-1", "Server").unwrap(),
+            7,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transfer_wire_envelope_round_trips_and_validates() {
+        let envelope = TransferWireEnvelope::new(
+            "message-1",
+            TransferWireMessage::OwnerRequest {
+                request: TransferOwnerRequest::Start {
+                    transfer: Box::new(wire_record()),
+                },
+            },
+        )
+        .unwrap();
+        let json = envelope.to_json().unwrap();
+        let decoded = TransferWireEnvelope::from_json(&json).unwrap();
+        assert_eq!(decoded, envelope);
+        assert!(json.contains("\"protocol_version\":1"));
+        assert!(json.contains("\"message\":\"owner_request\""));
+    }
+
+    #[test]
+    fn transfer_wire_rejects_unknown_fields_and_noncanonical_keys() {
+        let unknown = r#"{
+            "protocol_version":1,
+            "message_id":"message-1",
+            "message":{"message":"owner_request","body":{"request":"status","agent_pubkey":"abababababababababababababababababababababababababababababababab","extra":true}}
+        }"#;
+        assert!(matches!(
+            TransferWireEnvelope::from_json(unknown),
+            Err(WireError::Json(_))
+        ));
+
+        let command = TransferWireMessage::OwnerRequest {
+            request: TransferOwnerRequest::Status {
+                agent_pubkey: "AB".repeat(32),
+            },
+        };
+        assert_eq!(command.validate(), Err(WireError::InvalidAgentPubkey));
+    }
+
+    #[test]
+    fn executor_wire_command_requires_fenced_identifiers() {
+        let command = TransferExecutorCommand {
+            agent_pubkey: wire_agent_pubkey(),
+            operation_id: "operation-1".into(),
+            executor_instance_id: "server-1".into(),
+            expected_revision: 0,
+            expected_epoch: 1,
+            command: TransferCommand::BeginDrain,
+        };
+        let envelope = TransferWireEnvelope::new(
+            "message-2",
+            TransferWireMessage::ExecutorCommand { command },
+        )
+        .unwrap();
+        assert!(envelope.to_json().is_ok());
     }
 }
