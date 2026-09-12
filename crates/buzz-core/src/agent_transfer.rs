@@ -408,7 +408,7 @@ pub enum TransferOwnerRequest {
 impl TransferOwnerRequest {
     fn validate(&self) -> Result<(), WireError> {
         match self {
-            Self::Start { transfer } => transfer.validate().map_err(WireError::State),
+            Self::Start { transfer } => validate_transfer_record(transfer),
             Self::Status { agent_pubkey } => validate_agent_pubkey(agent_pubkey),
         }
     }
@@ -473,11 +473,11 @@ impl TransferWireResponse {
     fn validate(&self) -> Result<(), WireError> {
         match self {
             Self::Accepted { transfer } | Self::Applied { transfer } => {
-                transfer.validate().map_err(WireError::State)
+                validate_transfer_record(transfer)
             }
             Self::Status { transfer } => {
                 if let Some(record) = transfer {
-                    record.validate().map_err(WireError::State)?;
+                    validate_transfer_record(record)?;
                 }
                 Ok(())
             }
@@ -557,6 +557,11 @@ fn validate_agent_pubkey(value: &str) -> Result<(), WireError> {
         return Err(WireError::InvalidAgentPubkey);
     }
     Ok(())
+}
+
+fn validate_transfer_record(record: &TransferRecord) -> Result<(), WireError> {
+    validate_agent_pubkey(&record.agent_pubkey)?;
+    record.validate().map_err(WireError::State)
 }
 
 /// Errors returned before a state transition is committed.
@@ -868,6 +873,15 @@ mod tests {
         let command = TransferWireMessage::OwnerRequest {
             request: TransferOwnerRequest::Status {
                 agent_pubkey: "AB".repeat(32),
+            },
+        };
+        assert_eq!(command.validate(), Err(WireError::InvalidAgentPubkey));
+
+        let mut invalid_record = wire_record();
+        invalid_record.agent_pubkey = "agent-pubkey".into();
+        let command = TransferWireMessage::OwnerRequest {
+            request: TransferOwnerRequest::Start {
+                transfer: Box::new(invalid_record),
             },
         };
         assert_eq!(command.validate(), Err(WireError::InvalidAgentPubkey));
