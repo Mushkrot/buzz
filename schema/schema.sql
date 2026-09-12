@@ -637,6 +637,25 @@ CREATE TABLE archived_identities (
     PRIMARY KEY (community_id, pubkey)
 );
 
+-- ── Managed-agent transfer coordinator ──────────────────────────────────────
+-- One durable row per community/agent. The JSON record is the serialized
+-- buzz-core fencing contract; private keys and runtime credentials are never
+-- stored here. A unique operation id makes retries idempotent.
+
+CREATE TABLE managed_agent_transfers (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    agent_pubkey TEXT NOT NULL CHECK (length(agent_pubkey) BETWEEN 1 AND 256),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+    record      JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, agent_pubkey),
+    UNIQUE (community_id, operation_id)
+);
+
+CREATE INDEX managed_agent_transfers_updated_idx
+    ON managed_agent_transfers (community_id, updated_at DESC);
+
 -- ── Audit log ─────────────────────────────────────────────────────────────────
 -- Conformance: "Audit log and observability". Per-community hash chain:
 -- uniqueness (community_id, seq) and (community_id, hash). One chain per tenant.
@@ -1739,6 +1758,7 @@ SELECT attach_community_write_fence('event_mentions');
 SELECT attach_community_write_fence('events');
 SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');
+SELECT attach_community_write_fence('managed_agent_transfers');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');

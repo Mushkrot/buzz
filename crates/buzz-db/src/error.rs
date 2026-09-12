@@ -33,6 +33,10 @@ pub enum DbError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A transfer state-machine command or record failed core validation.
+    #[error("managed-agent transfer state error: {0}")]
+    Transfer(#[from] buzz_core::agent_transfer::Error),
+
     /// The caller lacks permission for the requested operation.
     #[error("access denied: {0}")]
     AccessDenied(String),

@@ -699,7 +699,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 40);
+        assert_eq!(migrations.len(), 41);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1241,6 +1241,18 @@ mod tests {
             operator_audit.contains("_operator_global_tables"),
             "migration 39 must register relay_operator_audit in _operator_global_tables"
         );
+
+        assert_eq!(migrations[39].version, 40);
+        assert!(migrations[39]
+            .sql
+            .as_str()
+            .contains("enqueue_push_match_job"));
+
+        assert_eq!(migrations[40].version, 41);
+        let managed_agent_transfers = migrations[40].sql.as_str();
+        assert!(managed_agent_transfers.contains("CREATE TABLE managed_agent_transfers"));
+        assert!(managed_agent_transfers.contains("UNIQUE (community_id, operation_id)"));
+        assert!(managed_agent_transfers.contains("attach_community_write_fence"));
     }
 
     #[test]
@@ -1776,8 +1788,13 @@ mod tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
+        let mut schema_fences = schema.fence_attachments.clone();
+        // Managed-agent transfer state is introduced by a later migration;
+        // it is intentionally outside migration 0029's deletion-control
+        // surface while still participating in the global write fence.
+        schema_fences.remove("managed_agent_transfers");
         assert_eq!(
-            expected_fences, schema.fence_attachments,
+            expected_fences, schema_fences,
             "write-fence attachment targets differ after recovery policy"
         );
 
