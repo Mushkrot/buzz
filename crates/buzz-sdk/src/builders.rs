@@ -4,6 +4,7 @@
 //! The caller signs: `builder.sign_with_keys(&keys)?`.
 
 use buzz_core::{
+    agent_transfer::TransferWireEnvelope,
     kind::{
         KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
         KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
@@ -15,11 +16,11 @@ use buzz_core::{
         KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
-        content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
-        OBSERVER_FRAME_TELEMETRY,
+        content_looks_like_nip44, encrypt_observer_payload, OBSERVER_AGENT_TAG,
+        OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
     },
 };
-use nostr::{EventBuilder, Kind, Tag};
+use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag};
 use uuid::Uuid;
 
 use crate::{
@@ -279,6 +280,27 @@ pub fn build_agent_observer_frame(
         encrypted_content,
     )
     .tags(tags))
+}
+
+/// Encrypt and build a typed transfer message on the existing observer frame.
+///
+/// The caller still signs the returned builder. The relay authenticates that
+/// signature and the cleartext routing tags; this helper only prevents clients
+/// from hand-encoding a transfer payload that fails its version or shape
+/// checks.
+pub fn build_encrypted_transfer_frame(
+    sender_keys: &Keys,
+    recipient: &PublicKey,
+    agent_pubkey: &str,
+    frame: &str,
+    envelope: &TransferWireEnvelope,
+) -> Result<EventBuilder, SdkError> {
+    envelope
+        .validate()
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let encrypted = encrypt_observer_payload(sender_keys, recipient, envelope)
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    build_agent_observer_frame(&recipient.to_hex(), agent_pubkey, frame, &encrypted)
 }
 
 /// Build a forum post thread root (kind 45001).
@@ -2463,6 +2485,36 @@ mod tests {
             &agent.public_key().to_hex()
         ));
         assert!(has_tag(&ev, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY));
+    }
+
+    #[test]
+    fn encrypted_transfer_frame_round_trips_typed_payload() {
+        let agent = keys();
+        let owner = keys();
+        let envelope = buzz_core::agent_transfer::TransferWireEnvelope::new(
+            "message-1",
+            buzz_core::agent_transfer::TransferWireMessage::OwnerRequest {
+                request: buzz_core::agent_transfer::TransferOwnerRequest::Status {
+                    agent_pubkey: agent.public_key().to_hex(),
+                },
+            },
+        )
+        .unwrap();
+        let event = build_encrypted_transfer_frame(
+            &agent,
+            &owner.public_key(),
+            &agent.public_key().to_hex(),
+            OBSERVER_FRAME_TELEMETRY,
+            &envelope,
+        )
+        .unwrap()
+        .sign_with_keys(&agent)
+        .unwrap();
+
+        let decoded: buzz_core::agent_transfer::TransferWireEnvelope =
+            buzz_core::observer::decrypt_observer_payload(&owner, &event).unwrap();
+        assert_eq!(decoded, envelope);
+        assert_eq!(event.pubkey, agent.public_key());
     }
 
     #[test]
