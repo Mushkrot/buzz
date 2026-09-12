@@ -4,16 +4,17 @@
 //! The caller signs: `builder.sign_with_keys(&keys)?`.
 
 use buzz_core::{
-    agent_transfer::TransferWireEnvelope,
+    agent_transfer::{TransferCoordinatorEnvelope, TransferWireEnvelope},
     kind::{
-        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-        KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
-        KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
-        KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_AGENT_OBSERVER_FRAME, KIND_AGENT_TRANSFER_COORDINATOR, KIND_APPROVAL_DENY,
+        KIND_APPROVAL_GRANT, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET,
+        KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+        KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+        KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST,
+        KIND_IA_UNARCHIVE_REQUEST, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
+        KIND_PRESENCE_UPDATE, KIND_PROJECT, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, encrypt_observer_payload, OBSERVER_AGENT_TAG,
@@ -301,6 +302,32 @@ pub fn build_encrypted_transfer_frame(
     let encrypted = encrypt_observer_payload(sender_keys, recipient, envelope)
         .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
     build_agent_observer_frame(&recipient.to_hex(), agent_pubkey, frame, &encrypted)
+}
+
+/// Build a relay-readable signed transfer-coordinator request (kind 24201).
+///
+/// The event content is a strict, secret-free coordinator envelope. The
+/// caller signs the returned builder; the relay verifies that signature and
+/// checks the `p`/`agent` tags against the registered owner and agent before
+/// dispatching the request. ACP payloads and credentials stay on kind 24200.
+pub fn build_transfer_coordinator_event(
+    owner_pubkey: &str,
+    agent_pubkey: &str,
+    envelope: &TransferCoordinatorEnvelope,
+) -> Result<EventBuilder, SdkError> {
+    let owner_pubkey = check_pubkey_hex(owner_pubkey, "owner_pubkey")?;
+    let agent_pubkey = check_pubkey_hex(agent_pubkey, "agent_pubkey")?;
+    let content = envelope
+        .to_json()
+        .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+    let tags = vec![tag(&["p", &owner_pubkey])?, tag(&["agent", &agent_pubkey])?];
+
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_AGENT_TRANSFER_COORDINATOR as u16),
+        content,
+    )
+    .tags(tags)
+    .allow_self_tagging())
 }
 
 /// Build a forum post thread root (kind 45001).
@@ -2515,6 +2542,41 @@ mod tests {
             buzz_core::observer::decrypt_observer_payload(&owner, &event).unwrap();
         assert_eq!(decoded, envelope);
         assert_eq!(event.pubkey, agent.public_key());
+    }
+
+    #[test]
+    fn transfer_coordinator_event_is_public_but_strictly_routed() {
+        let owner = keys();
+        let agent = keys();
+        let envelope = buzz_core::agent_transfer::TransferCoordinatorEnvelope::new(
+            "message-1",
+            buzz_core::agent_transfer::TransferCoordinatorMessage::OwnerRequest {
+                request: buzz_core::agent_transfer::TransferOwnerRequest::Status {
+                    agent_pubkey: agent.public_key().to_hex(),
+                },
+            },
+        )
+        .unwrap();
+        let event = build_transfer_coordinator_event(
+            &owner.public_key().to_hex(),
+            &agent.public_key().to_hex(),
+            &envelope,
+        )
+        .unwrap()
+        .sign_with_keys(&owner)
+        .unwrap();
+
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::agent_transfer::TRANSFER_COORDINATOR_EVENT_KIND as u16
+        );
+        assert_eq!(
+            buzz_core::agent_transfer::TransferCoordinatorEnvelope::from_json(&event.content)
+                .unwrap(),
+            envelope
+        );
+        assert!(has_tag(&event, "p", &owner.public_key().to_hex()));
+        assert!(has_tag(&event, "agent", &agent.public_key().to_hex()));
     }
 
     #[test]

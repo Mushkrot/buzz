@@ -10,6 +10,11 @@ use thiserror::Error;
 
 /// Version of the transfer state-machine contract.
 pub const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+/// Ephemeral Nostr kind used for relay-readable, signed transfer requests.
+///
+/// The event carries only the public transfer state-machine request. Secrets
+/// and ACP payloads remain on the encrypted observer-frame path (kind 24200).
+pub use crate::kind::KIND_AGENT_TRANSFER_COORDINATOR as TRANSFER_COORDINATOR_EVENT_KIND;
 const MAX_REASON_BYTES: usize = 512;
 const MAX_MESSAGE_ID_BYTES: usize = 128;
 
@@ -323,6 +328,104 @@ pub enum TransferWireMessage {
     },
 }
 
+/// Public request envelope submitted to the relay coordinator.
+///
+/// This is deliberately separate from [`TransferWireEnvelope`]. The latter is
+/// end-to-end encrypted and may contain responses; this envelope is readable
+/// by the relay and therefore contains only the secret-free state-machine
+/// request. The signed Nostr event and its strict `p`/`agent` tags provide the
+/// transport identity; this JSON provides the versioned request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferCoordinatorEnvelope {
+    /// Transfer protocol version.
+    pub protocol_version: u32,
+    /// Caller-chosen correlation id.
+    pub message_id: String,
+    /// Public request body.
+    pub message: TransferCoordinatorMessage,
+}
+
+/// Public transfer request types accepted by the relay coordinator event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "message",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum TransferCoordinatorMessage {
+    /// A request signed by the registered owner.
+    OwnerRequest {
+        /// Owner request body.
+        request: TransferOwnerRequest,
+    },
+    /// A command signed by the managed agent identity.
+    ExecutorCommand {
+        /// Executor command body.
+        command: TransferExecutorCommand,
+    },
+}
+
+impl TransferCoordinatorEnvelope {
+    /// Construct and validate a public coordinator request envelope.
+    pub fn new(
+        message_id: impl Into<String>,
+        message: TransferCoordinatorMessage,
+    ) -> Result<Self, WireError> {
+        let envelope = Self {
+            protocol_version: TRANSFER_PROTOCOL_VERSION,
+            message_id: message_id.into(),
+            message,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Validate the public request before relay dispatch.
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.protocol_version != TRANSFER_PROTOCOL_VERSION {
+            return Err(WireError::UnsupportedProtocol(self.protocol_version));
+        }
+        if self.message_id.is_empty()
+            || self.message_id.len() > MAX_MESSAGE_ID_BYTES
+            || self.message_id.chars().any(char::is_control)
+        {
+            return Err(WireError::InvalidMessageId);
+        }
+        match &self.message {
+            TransferCoordinatorMessage::OwnerRequest { request } => request.validate(),
+            TransferCoordinatorMessage::ExecutorCommand { command } => command.validate(),
+        }
+    }
+
+    /// Serialize and validate the public request.
+    pub fn to_json(&self) -> Result<String, WireError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|error| WireError::Json(error.to_string()))
+    }
+
+    /// Parse and validate a public request from JSON.
+    pub fn from_json(value: &str) -> Result<Self, WireError> {
+        let envelope: Self =
+            serde_json::from_str(value).map_err(|error| WireError::Json(error.to_string()))?;
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Convert the public request to the coordinator's common wire message.
+    pub fn into_wire_message(self) -> TransferWireMessage {
+        match self.message {
+            TransferCoordinatorMessage::OwnerRequest { request } => {
+                TransferWireMessage::OwnerRequest { request }
+            }
+            TransferCoordinatorMessage::ExecutorCommand { command } => {
+                TransferWireMessage::ExecutorCommand { command }
+            }
+        }
+    }
+}
+
 impl TransferWireMessage {
     fn validate(&self) -> Result<(), WireError> {
         match self {
@@ -470,6 +573,12 @@ pub enum TransferWireResponse {
 }
 
 impl TransferWireResponse {
+    /// Serialize a validated coordinator response for a transport envelope.
+    pub fn to_json(&self) -> Result<String, WireError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|error| WireError::Json(error.to_string()))
+    }
+
     fn validate(&self) -> Result<(), WireError> {
         match self {
             Self::Accepted { transfer } | Self::Applied { transfer } => {
@@ -885,6 +994,41 @@ mod tests {
             },
         };
         assert_eq!(command.validate(), Err(WireError::InvalidAgentPubkey));
+    }
+
+    #[test]
+    fn coordinator_envelope_round_trips_without_response_variants() {
+        let envelope = TransferCoordinatorEnvelope::new(
+            "message-3",
+            TransferCoordinatorMessage::OwnerRequest {
+                request: TransferOwnerRequest::Status {
+                    agent_pubkey: wire_agent_pubkey(),
+                },
+            },
+        )
+        .unwrap();
+        let json = envelope.to_json().unwrap();
+        let decoded = TransferCoordinatorEnvelope::from_json(&json).unwrap();
+        assert_eq!(decoded, envelope);
+        assert!(json.contains("\"message\":\"owner_request\""));
+        assert!(TransferCoordinatorEnvelope::from_json(&json.replace(
+            "\"message_id\":\"message-3\"",
+            "\"unknown\":true,\"message_id\":\"message-3\""
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn coordinator_envelope_rejects_response_body() {
+        let response = TransferWireResponse::Status { transfer: None };
+        let json = serde_json::json!({
+            "protocol_version": 1,
+            "message_id": "message-4",
+            "message": {"response": "status", "transfer": null}
+        })
+        .to_string();
+        assert!(TransferCoordinatorEnvelope::from_json(&json).is_err());
+        assert!(response.to_json().is_ok());
     }
 
     #[test]

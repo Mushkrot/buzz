@@ -8,7 +8,8 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_unshared_gated_event, AUTHOR_ONLY_KINDS,
-    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    KIND_AGENT_OBSERVER_FRAME, KIND_AGENT_TRANSFER_COORDINATOR, KIND_GIFT_WRAP,
+    KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -688,6 +689,20 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             return;
         }
         handle_agent_observer_event(event, conn_id, &event_id_hex, conn, state).await;
+        return;
+    }
+
+    if kind_u32 == KIND_AGENT_TRANSFER_COORDINATOR {
+        if !scopes.is_empty() && !scopes.contains(&buzz_auth::Scope::MessagesWrite) {
+            reject("scope");
+            conn.send(RelayMessage::ok(
+                &event_id_hex,
+                false,
+                "restricted: insufficient scope for transfer coordinator requests",
+            ));
+            return;
+        }
+        crate::agent_transfer::handle_coordinator_event(event, &event_id_hex, conn, state).await;
         return;
     }
 

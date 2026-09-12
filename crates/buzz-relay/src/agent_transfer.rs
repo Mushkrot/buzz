@@ -5,10 +5,14 @@
 //! and delegates state changes to `buzz-db`. It does not start processes,
 //! copy keys, or treat a text response as proof that a runtime is quiescent.
 
+use std::sync::Arc;
+
 use buzz_core::agent_transfer::{
-    TransferExecutorCommand, TransferOwnerRequest, TransferRecord, TransferWireMessage,
-    TransferWireResponse, WireError,
+    TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferExecutorCommand,
+    TransferOwnerRequest, TransferRecord, TransferWireError, TransferWireErrorCode,
+    TransferWireMessage, TransferWireResponse, WireError,
 };
+use buzz_core::verification::verify_event;
 use buzz_core::CommunityId;
 use buzz_db::managed_agent_transfers::{
     CreateManagedAgentTransferResult, ManagedAgentTransferJournalEntry,
@@ -54,6 +58,258 @@ pub struct TransferCoordinator {
 /// payload on one JSON contract instead of maintaining two subtly different
 /// request shapes.
 pub type ExecutorCommandRequest = TransferExecutorCommand;
+
+/// Handle one relay-readable signed transfer request.
+///
+/// The request is intentionally ephemeral: it is authenticated, authorized,
+/// dispatched to the durable coordinator, and answered through the sender's
+/// NIP-01 `OK` frame. It is never stored or fanned out as a public timeline
+/// event. Only public state-machine metadata is accepted; secrets remain on
+/// the encrypted observer-frame path.
+pub async fn handle_coordinator_event(
+    event: nostr::Event,
+    event_id_hex: &str,
+    conn: Arc<crate::connection::ConnectionState>,
+    state: Arc<crate::state::AppState>,
+) {
+    let event_clone = event.clone();
+    let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
+    if !matches!(verify_result, Ok(Ok(()))) {
+        let message = match verify_result {
+            Ok(Err(error)) => format!("invalid: {error}"),
+            _ => "error: internal error".to_owned(),
+        };
+        conn.send(crate::protocol::RelayMessage::ok(
+            event_id_hex,
+            false,
+            &message,
+        ));
+        return;
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let event_ts = event.created_at.as_secs() as i64;
+    if (event_ts - now).unsigned_abs() > 300 {
+        conn.send(crate::protocol::RelayMessage::ok(
+            event_id_hex,
+            false,
+            "invalid: transfer coordinator timestamp outside ±5 minute freshness window",
+        ));
+        return;
+    }
+
+    let envelope = match TransferCoordinatorEnvelope::from_json(&event.content) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            conn.send(crate::protocol::RelayMessage::ok(
+                event_id_hex,
+                false,
+                &format!("invalid: transfer coordinator payload: {error}"),
+            ));
+            return;
+        }
+    };
+    let route = match coordinator_route(&event, &envelope) {
+        Ok(route) => route,
+        Err(message) => {
+            conn.send(crate::protocol::RelayMessage::ok(
+                event_id_hex,
+                false,
+                &format!("invalid: {message}"),
+            ));
+            return;
+        }
+    };
+
+    let registered_owner = state
+        .db
+        .is_agent_owner(
+            conn.tenant.community(),
+            &route.agent.to_bytes(),
+            &route.owner.to_bytes(),
+        )
+        .await;
+    match registered_owner {
+        Ok(true) => {}
+        Ok(false) => {
+            let response = rejected_response(
+                TransferWireErrorCode::Unauthorized,
+                "the signed owner is not registered for this agent",
+            );
+            send_coordinator_response(&conn, event_id_hex, false, response);
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(event_id = %event_id_hex, "transfer owner lookup failed: {error}");
+            conn.send(crate::protocol::RelayMessage::ok(
+                event_id_hex,
+                false,
+                "error: internal server error",
+            ));
+            return;
+        }
+    }
+
+    let response = state
+        .transfer_coordinator
+        .dispatch_wire(
+            conn.tenant.community(),
+            &event.pubkey.to_bytes(),
+            envelope.into_wire_message(),
+        )
+        .await;
+    match response {
+        Ok(response) => send_coordinator_response(&conn, event_id_hex, true, response),
+        Err(error) => match map_coordinator_error(error) {
+            Some(response) => send_coordinator_response(&conn, event_id_hex, false, response),
+            None => {
+                conn.send(crate::protocol::RelayMessage::ok(
+                    event_id_hex,
+                    false,
+                    "error: internal server error",
+                ));
+            }
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CoordinatorRoute {
+    owner: nostr::PublicKey,
+    agent: nostr::PublicKey,
+}
+
+fn coordinator_route(
+    event: &nostr::Event,
+    envelope: &TransferCoordinatorEnvelope,
+) -> Result<CoordinatorRoute, String> {
+    let (owner, agent) = strict_coordinator_tags(event)?;
+    let content_agent = match &envelope.message {
+        TransferCoordinatorMessage::OwnerRequest { request } => match request {
+            TransferOwnerRequest::Start { transfer } => &transfer.agent_pubkey,
+            TransferOwnerRequest::Status { agent_pubkey } => agent_pubkey,
+        },
+        TransferCoordinatorMessage::ExecutorCommand { command } => &command.agent_pubkey,
+    };
+    if content_agent != &agent.to_hex() {
+        return Err("agent tag does not match the request body".into());
+    }
+
+    match &envelope.message {
+        TransferCoordinatorMessage::OwnerRequest { .. } if event.pubkey != owner => {
+            Err("owner request must be signed by the tagged owner".into())
+        }
+        TransferCoordinatorMessage::ExecutorCommand { .. } if event.pubkey != agent => {
+            Err("executor command must be signed by the managed agent".into())
+        }
+        _ => Ok(CoordinatorRoute { owner, agent }),
+    }
+}
+
+fn strict_coordinator_tags(
+    event: &nostr::Event,
+) -> Result<(nostr::PublicKey, nostr::PublicKey), String> {
+    let mut owner = None;
+    let mut agent = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() != 2 {
+            return Err("transfer coordinator tags must contain exactly two values".into());
+        }
+        let slot = match parts[0].as_str() {
+            "p" => &mut owner,
+            "agent" => &mut agent,
+            _ => return Err("transfer coordinator contains an unsupported tag".into()),
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "transfer coordinator has duplicate `{}` tag",
+                parts[0]
+            ));
+        }
+        let key = nostr::PublicKey::from_hex(&parts[1])
+            .map_err(|_| format!("transfer coordinator `{}` tag is not a pubkey", parts[0]))?;
+        if key.to_hex() != parts[1] {
+            return Err(format!(
+                "transfer coordinator `{}` tag must use lowercase canonical hex",
+                parts[0]
+            ));
+        }
+        *slot = Some(key);
+    }
+    let owner = owner.ok_or_else(|| "transfer coordinator is missing the `p` tag".to_owned())?;
+    let agent =
+        agent.ok_or_else(|| "transfer coordinator is missing the `agent` tag".to_owned())?;
+    Ok((owner, agent))
+}
+
+fn rejected_response(code: TransferWireErrorCode, detail: &str) -> TransferWireResponse {
+    TransferWireResponse::Rejected {
+        error: TransferWireError {
+            code,
+            detail: detail.to_owned(),
+        },
+    }
+}
+
+fn map_coordinator_error(error: TransferCoordinatorError) -> Option<TransferWireResponse> {
+    let (code, detail) = match error {
+        TransferCoordinatorError::Unauthorized => (
+            TransferWireErrorCode::Unauthorized,
+            "owner authorization is required",
+        ),
+        TransferCoordinatorError::ExecutorIdentityMismatch => (
+            TransferWireErrorCode::Unauthorized,
+            "signed identity does not match the managed agent",
+        ),
+        TransferCoordinatorError::ExecutorMismatch => (
+            TransferWireErrorCode::StaleState,
+            "transfer state is stale; refresh status before retrying",
+        ),
+        TransferCoordinatorError::InvalidAgentPubkey => (
+            TransferWireErrorCode::InvalidRequest,
+            "managed agent public key is invalid",
+        ),
+        TransferCoordinatorError::UnsupportedMessage => (
+            TransferWireErrorCode::InvalidRequest,
+            "unsupported transfer coordinator message",
+        ),
+        TransferCoordinatorError::InvalidCommand(_) => (
+            TransferWireErrorCode::InvalidRequest,
+            "executor command is invalid",
+        ),
+        TransferCoordinatorError::Database(DbError::NotFound(_)) => (
+            TransferWireErrorCode::Conflict,
+            "transfer operation was not found",
+        ),
+        TransferCoordinatorError::Database(DbError::InvalidData(_)) => (
+            TransferWireErrorCode::Conflict,
+            "transfer request conflicts with current state",
+        ),
+        TransferCoordinatorError::Database(_) => return None,
+    };
+    Some(rejected_response(code, detail))
+}
+
+fn send_coordinator_response(
+    conn: &crate::connection::ConnectionState,
+    event_id_hex: &str,
+    accepted: bool,
+    response: TransferWireResponse,
+) {
+    let message = match response.to_json() {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::error!(event_id = %event_id_hex, "transfer response serialization failed: {error}");
+            "error: internal server error".to_owned()
+        }
+    };
+    conn.send(crate::protocol::RelayMessage::ok(
+        event_id_hex,
+        accepted,
+        &message,
+    ));
+}
 
 impl TransferCoordinator {
     /// Construct a coordinator over the relay's authoritative database handle.
@@ -247,6 +503,7 @@ fn require_executor_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::agent_transfer::TRANSFER_COORDINATOR_EVENT_KIND;
 
     #[test]
     fn canonical_agent_pubkey_requires_lowercase_32_byte_hex() {
@@ -272,5 +529,66 @@ mod tests {
             require_executor_identity(&[0xcd; 32], &command),
             Err(TransferCoordinatorError::ExecutorIdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn coordinator_route_requires_matching_owner_and_agent_tags() {
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let envelope = TransferCoordinatorEnvelope::new(
+            "message-1",
+            TransferCoordinatorMessage::OwnerRequest {
+                request: TransferOwnerRequest::Status {
+                    agent_pubkey: agent.public_key().to_hex(),
+                },
+            },
+        )
+        .expect("valid envelope");
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(TRANSFER_COORDINATOR_EVENT_KIND as u16),
+            envelope.to_json().expect("serialize envelope"),
+        )
+        .tags([
+            nostr::Tag::parse(["p", &owner.public_key().to_hex()]).expect("owner tag"),
+            nostr::Tag::parse(["agent", &agent.public_key().to_hex()]).expect("agent tag"),
+        ])
+        .allow_self_tagging()
+        .sign_with_keys(&owner)
+        .expect("sign event");
+
+        let route = coordinator_route(&event, &envelope).expect("valid route");
+        assert_eq!(route.owner, owner.public_key());
+        assert_eq!(route.agent, agent.public_key());
+    }
+
+    #[test]
+    fn coordinator_route_rejects_extra_tags_and_wrong_signer() {
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        let envelope = TransferCoordinatorEnvelope::new(
+            "message-1",
+            TransferCoordinatorMessage::OwnerRequest {
+                request: TransferOwnerRequest::Status {
+                    agent_pubkey: agent.public_key().to_hex(),
+                },
+            },
+        )
+        .expect("valid envelope");
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(TRANSFER_COORDINATOR_EVENT_KIND as u16),
+            envelope.to_json().expect("serialize envelope"),
+        )
+        .tags([
+            nostr::Tag::parse(["p", &owner.public_key().to_hex()]).expect("owner tag"),
+            nostr::Tag::parse(["agent", &agent.public_key().to_hex()]).expect("agent tag"),
+            nostr::Tag::parse(["unexpected", "value"]).expect("extra tag"),
+        ])
+        .allow_self_tagging()
+        .sign_with_keys(&stranger)
+        .expect("sign event");
+
+        let error = coordinator_route(&event, &envelope).expect_err("route must reject");
+        assert!(error.contains("unsupported tag"));
     }
 }
