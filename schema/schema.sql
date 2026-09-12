@@ -656,6 +656,31 @@ CREATE TABLE managed_agent_transfers (
 CREATE INDEX managed_agent_transfers_updated_idx
     ON managed_agent_transfers (community_id, updated_at DESC);
 
+-- Append-only accepted-transition history for recovery and diagnostics. The
+-- snapshot is the same public transfer contract as the coordinator row; it
+-- never contains keys, credentials, process handles, or harness sessions.
+
+CREATE TABLE managed_agent_transfer_journal (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    agent_pubkey TEXT NOT NULL CHECK (length(agent_pubkey) BETWEEN 1 AND 256),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+    revision    BIGINT NOT NULL CHECK (revision >= 0),
+    epoch       BIGINT NOT NULL CHECK (epoch > 0),
+    event_kind  TEXT NOT NULL CHECK (event_kind IN ('created', 'command')),
+    command     JSONB CHECK (command IS NULL OR jsonb_typeof(command) = 'object'),
+    record      JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, agent_pubkey, revision),
+    UNIQUE (community_id, operation_id, revision),
+    CHECK (
+        (event_kind = 'created' AND command IS NULL)
+        OR (event_kind = 'command' AND command IS NOT NULL)
+    )
+);
+
+CREATE INDEX managed_agent_transfer_journal_created_idx
+    ON managed_agent_transfer_journal (community_id, agent_pubkey, created_at DESC);
+
 -- ── Audit log ─────────────────────────────────────────────────────────────────
 -- Conformance: "Audit log and observability". Per-community hash chain:
 -- uniqueness (community_id, seq) and (community_id, hash). One chain per tenant.
@@ -1759,6 +1784,7 @@ SELECT attach_community_write_fence('events');
 SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');
 SELECT attach_community_write_fence('managed_agent_transfers');
+SELECT attach_community_write_fence('managed_agent_transfer_journal');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');

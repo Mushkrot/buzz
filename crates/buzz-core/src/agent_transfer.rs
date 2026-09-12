@@ -73,7 +73,8 @@ impl TransferPhase {
 }
 
 /// A command applied by the relay coordinator or a runtime supervisor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TransferCommand {
     /// Source may stop accepting new work.
     BeginDrain,
@@ -526,5 +527,27 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let decoded: TransferRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn json_round_trip_preserves_transfer_commands() {
+        let commands = [
+            TransferCommand::BeginDrain,
+            TransferCommand::ConfirmSourceQuiesced,
+            TransferCommand::ActivateTarget,
+            TransferCommand::ConfirmTarget,
+            TransferCommand::Complete,
+            TransferCommand::Cancel,
+            TransferCommand::ResumeSource,
+            TransferCommand::MarkNeedsAttention {
+                reason: "target acknowledgement lost".into(),
+            },
+        ];
+
+        for original in commands {
+            let json = serde_json::to_string(&original).unwrap();
+            let decoded: TransferCommand = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, original);
+        }
     }
 }

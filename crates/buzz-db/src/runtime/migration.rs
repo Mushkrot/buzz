@@ -699,7 +699,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 41);
+        assert_eq!(migrations.len(), 42);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1253,6 +1253,14 @@ mod tests {
         assert!(managed_agent_transfers.contains("CREATE TABLE managed_agent_transfers"));
         assert!(managed_agent_transfers.contains("UNIQUE (community_id, operation_id)"));
         assert!(managed_agent_transfers.contains("attach_community_write_fence"));
+
+        assert_eq!(migrations[41].version, 42);
+        let managed_agent_transfer_journal = migrations[41].sql.as_str();
+        assert!(
+            managed_agent_transfer_journal.contains("CREATE TABLE managed_agent_transfer_journal")
+        );
+        assert!(managed_agent_transfer_journal.contains("event_kind"));
+        assert!(managed_agent_transfer_journal.contains("attach_community_write_fence"));
     }
 
     #[test]
@@ -1793,6 +1801,7 @@ mod tests {
         // it is intentionally outside migration 0029's deletion-control
         // surface while still participating in the global write fence.
         schema_fences.remove("managed_agent_transfers");
+        schema_fences.remove("managed_agent_transfer_journal");
         assert_eq!(
             expected_fences, schema_fences,
             "write-fence attachment targets differ after recovery policy"
