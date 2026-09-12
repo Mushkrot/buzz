@@ -29,6 +29,7 @@ use buzz_search::SearchService;
 use buzz_workflow::WorkflowEngine;
 use deadpool_redis;
 
+use crate::agent_transfer::TransferCoordinator;
 use crate::audio::AudioRoomManager;
 use crate::config::Config;
 use crate::connection::{ConnectionSubscriptions, RestartClose};
@@ -632,6 +633,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Database connection pool.
     pub db: Db,
+    /// Durable managed-agent transfer coordinator.
+    pub transfer_coordinator: TransferCoordinator,
     /// Redis pool for readiness health checks.
     pub redis_pool: deadpool_redis::Pool,
     /// Audit event service, absent when audit logging is disabled.
@@ -860,6 +863,7 @@ impl AppState {
         let audit_enabled = audit_arc.is_some();
         let state = Self {
             config: Arc::new(config),
+            transfer_coordinator: TransferCoordinator::new(db.clone()),
             db,
             redis_pool,
             audit: audit_arc,

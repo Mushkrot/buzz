@@ -6,6 +6,8 @@ mod admission;
 mod build_info;
 mod rejection;
 
+/// Relay-side durable coordination boundary for managed-agent transfers.
+pub mod agent_transfer;
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.
