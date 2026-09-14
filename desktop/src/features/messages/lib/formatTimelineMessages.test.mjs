@@ -14,6 +14,7 @@ import {
   CHANNEL_TIMELINE_CONTENT_KINDS,
   KIND_HUDDLE_ENDED,
   KIND_HUDDLE_STARTED,
+  KIND_SYSTEM_MESSAGE,
 } from "@/shared/constants/kinds";
 
 const HEX64_A =
@@ -87,6 +88,51 @@ function huddleStarted(overrides = {}) {
     ...overrides,
   };
 }
+
+function dmCreatedSystemMessage(overrides = {}) {
+  return {
+    id: HEX64_A,
+    pubkey: PUBKEY_B,
+    kind: KIND_SYSTEM_MESSAGE,
+    created_at: 1_700_000_001,
+    content: JSON.stringify({
+      actor: PUBKEY_B,
+      participants: [PUBKEY_A, PUBKEY_B],
+      type: "dm_created",
+    }),
+    tags: [["h", CHANNEL_ID]],
+    sig: "sig",
+    ...overrides,
+  };
+}
+
+test("dm creation system events are not timeline messages", () => {
+  const dmCreated = dmCreatedSystemMessage();
+
+  assert.equal(
+    isTimelineContentEvent(dmCreated),
+    false,
+    "the relay's DM creation bookkeeping event must not enter the message timeline",
+  );
+  assert.deepEqual(
+    formatTimelineMessages(
+      [dmCreated, streamMessage({ id: HEX64_B })],
+      null,
+      undefined,
+      null,
+    ).map((message) => message.id),
+    [HEX64_B],
+    "a DM creation event must not be rendered as raw JSON next to real messages",
+  );
+
+  assert.equal(
+    isTimelineContentEvent(
+      streamMessage({ content: JSON.stringify({ type: "dm_created" }) }),
+    ),
+    true,
+    "a user-authored JSON message must remain a normal timeline message",
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Keystone regression: aux events (edits/deletions) apply by `#e` reference,

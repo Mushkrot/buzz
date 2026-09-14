@@ -49,19 +49,39 @@ import { truncatePubkey } from "@/shared/lib/pubkey";
 
 const HEX_RE = /^[0-9a-f]+$/i;
 
+/**
+ * DM creation is represented by a relay-signed system event so the relay can
+ * publish the same lifecycle signal to every participant. It is bookkeeping,
+ * not a conversational message; rendering its JSON body as a normal message
+ * leaks an internal protocol payload into the DM timeline.
+ */
+function isDmCreatedSystemEvent(
+  event: Pick<RelayEvent, "kind" | "content">,
+): boolean {
+  if (event.kind !== KIND_SYSTEM_MESSAGE) return false;
+
+  try {
+    const payload = JSON.parse(event.content) as { type?: unknown };
+    return payload.type === "dm_created";
+  } catch {
+    return false;
+  }
+}
+
 export function isTimelineContentEvent(event: RelayEvent) {
   return (
-    event.kind === KIND_STREAM_MESSAGE ||
-    event.kind === KIND_STREAM_MESSAGE_V2 ||
-    event.kind === KIND_STREAM_MESSAGE_DIFF ||
-    event.kind === KIND_SYSTEM_MESSAGE ||
-    event.kind === KIND_JOB_REQUEST ||
-    event.kind === KIND_JOB_ACCEPTED ||
-    event.kind === KIND_JOB_PROGRESS ||
-    event.kind === KIND_JOB_RESULT ||
-    event.kind === KIND_JOB_CANCEL ||
-    event.kind === KIND_JOB_ERROR ||
-    event.kind === KIND_HUDDLE_STARTED
+    !isDmCreatedSystemEvent(event) &&
+    (event.kind === KIND_STREAM_MESSAGE ||
+      event.kind === KIND_STREAM_MESSAGE_V2 ||
+      event.kind === KIND_STREAM_MESSAGE_DIFF ||
+      event.kind === KIND_SYSTEM_MESSAGE ||
+      event.kind === KIND_JOB_REQUEST ||
+      event.kind === KIND_JOB_ACCEPTED ||
+      event.kind === KIND_JOB_PROGRESS ||
+      event.kind === KIND_JOB_RESULT ||
+      event.kind === KIND_JOB_CANCEL ||
+      event.kind === KIND_JOB_ERROR ||
+      event.kind === KIND_HUDDLE_STARTED)
   );
 }
 
