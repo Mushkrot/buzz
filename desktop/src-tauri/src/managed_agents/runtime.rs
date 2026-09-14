@@ -403,12 +403,15 @@ pub(crate) fn configure_runtime_cli(
 ///
 /// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
 /// records that have no NIP-OA `auth_tag`. See `build_respond_to_env`.
+/// `transfer_bootstrap`: one signed, secret-free owner-start event consumed by
+/// a target ACP process during its first startup after offline delivery.
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
     relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
+    transfer_bootstrap: Option<&str>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
@@ -777,6 +780,11 @@ pub fn spawn_agent_child(
     }
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
+    if let Some(event) = transfer_bootstrap {
+        command.env("BUZZ_ACP_TRANSFER_BOOTSTRAP", event);
+    } else {
+        command.env_remove("BUZZ_ACP_TRANSFER_BOOTSTRAP");
+    }
 
     // Git credential helper: NIP-98 auth for Buzz relay git via git-credential-nostr.
     // Ephemeral GIT_CONFIG_COUNT env vars scoped to relay HTTP URL; NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY.
@@ -967,7 +975,7 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex, None)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),

@@ -67,6 +67,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // ambient env var must not be able to forge setup mode (NotReady) on a
     // Ready agent or suppress it (empty/stale payload) on a NotReady one.
     "BUZZ_ACP_SETUP_PAYLOAD",
+    // One signed, secret-free transfer-start event supplied by Desktop when
+    // a target runtime is bootstrapped after relay delivery.
+    "BUZZ_ACP_TRANSFER_BOOTSTRAP",
     // Desktop ownership markers: these brand every spawned harness with the
     // launching Desktop instance. A user-supplied override would let a
     // definition masquerade as a different instance or fake the nonce used

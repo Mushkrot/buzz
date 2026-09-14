@@ -10,6 +10,7 @@ use std::{
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::huddle::HuddleState;
 pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, ResolvedIdentity};
@@ -47,6 +48,17 @@ pub struct AppState {
     pub managed_agents_store_lock: Mutex<()>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
+    /// Secret-free signed transfer-start events received while the target ACP
+    /// process is offline, keyed by the exact agent/relay runtime pair.
+    pub transfer_bootstrap_events: Mutex<HashMap<ManagedAgentRuntimeKey, String>>,
+    /// Background target bootstrap supervisor is installed once after the
+    /// active workspace is applied.
+    pub transfer_bootstrap_supervisor_started: AtomicBool,
+    /// Live relay workers owned by the bootstrap supervisor. The value stores
+    /// a configuration fingerprint and cancellation token so a workspace or
+    /// agent-key change cannot leave a stale listener running.
+    pub transfer_bootstrap_workers:
+        Mutex<HashMap<String, (String, CancellationToken)>>,
     pub provider_deploy_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
@@ -214,6 +226,9 @@ pub fn build_app_state() -> AppState {
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
+        transfer_bootstrap_events: Mutex::new(HashMap::new()),
+        transfer_bootstrap_supervisor_started: AtomicBool::new(false),
+        transfer_bootstrap_workers: Mutex::new(HashMap::new()),
         provider_deploy_locks: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),

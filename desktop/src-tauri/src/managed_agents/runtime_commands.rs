@@ -269,6 +269,12 @@ fn start_pair(
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    let pending_transfer_bootstrap = state
+        .transfer_bootstrap_events
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&key)
+        .cloned();
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -277,6 +283,13 @@ fn start_pair(
         .get_mut(&key)
         .is_some_and(|runtime| runtime.child.try_wait().ok().flatten().is_none())
     {
+        if pending_transfer_bootstrap.is_some() {
+            state
+                .transfer_bootstrap_events
+                .lock()
+                .map_err(|e| e.to_string())?
+                .remove(&key);
+        }
         let status = status_for(&app, record, &key, runtimes.get(&key), None);
         return Ok(status);
     }
@@ -288,7 +301,14 @@ fn start_pair(
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
+    let mut process = spawn_agent_child(
+        &app,
+        record,
+        &key.relay_url,
+        lazy,
+        owner.as_deref(),
+        pending_transfer_bootstrap.as_deref(),
+    )?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
         key: key.clone(),
@@ -307,6 +327,13 @@ fn start_pair(
     record.last_stopped_at = None;
     record.last_error = None;
     runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+    if pending_transfer_bootstrap.is_some() {
+        state
+            .transfer_bootstrap_events
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&key);
+    }
     let status = status_for(&app, record, &key, runtimes.get(&key), None);
     drop(runtimes);
     save_managed_agents(&app, &records)?;

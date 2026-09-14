@@ -12,6 +12,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod setup_mode;
+mod transfer_bootstrap;
 mod transfer_supervisor;
 mod usage;
 
@@ -2900,6 +2901,33 @@ async fn tokio_main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("transfer coordinator subscribe error: {e}"))?;
         relay_observer_control_rx = relay.take_observer_control_rx();
         tracing::info!("transfer coordinator subscription enabled");
+    }
+    // A desktop target supervisor may have received the durable owner-start
+    // event before this ACP process existed. Merge that one authenticated
+    // bootstrap event into the same queue used by live relay delivery so the
+    // state machine has one receive path and one validation boundary.
+    if let Ok(raw) = std::env::var("BUZZ_ACP_TRANSFER_BOOTSTRAP") {
+        match transfer_bootstrap::parse_event(&raw, &pubkey_hex) {
+            Ok(event) => {
+                let (tx, rx) = mpsc::channel(256);
+                if tx.send(event).await.is_ok() {
+                    if let Some(mut live_rx) = relay_observer_control_rx.take() {
+                        let forward_tx = tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = live_rx.recv().await {
+                                if forward_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    relay_observer_control_rx = Some(rx);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring invalid transfer bootstrap event")
+            }
+        }
     }
     if config.relay_observer {
         if let (Some(observer), Some(owner_pubkey_hex)) =

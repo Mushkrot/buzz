@@ -319,6 +319,13 @@ pub async fn apply_workspace(
         .managed_agent_restore_pending
         .swap(false, Ordering::AcqRel);
 
+    // Start the target-side transfer listener only after the active relay and
+    // identity have been installed. The supervisor is idempotent and keeps a
+    // small authenticated listener for each local managed agent so an offline
+    // target can receive a queued owner-start event before its ACP process is
+    // running.
+    crate::managed_agents::start_transfer_bootstrap_supervisor(&restore_app);
+
     // Transfer the apply guard to launch restoration. The command can return
     // promptly, but a queued workspace cannot mutate relay/identity until the
     // restore has completed every mutable workspace read and side effect.
