@@ -24,6 +24,8 @@ pub mod event;
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
+/// Durable retryable delivery queue for managed-agent transfer requests.
+pub mod managed_agent_transfer_deliveries;
 /// Durable managed-agent transfer coordinator persistence.
 pub mod managed_agent_transfers;
 /// Community moderation: reports, bans/timeouts, audit actions.

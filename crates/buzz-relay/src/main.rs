@@ -763,6 +763,17 @@ async fn main() -> anyhow::Result<()> {
         info!("Admin outbox delivery worker started");
     }
 
+    // Managed-agent transfer delivery worker — retries accepted, secret-free
+    // coordinator events until the target runtime reconnects. This transports
+    // events only; the ACP runtime supervisor owns process lifecycle decisions.
+    {
+        let transfer_delivery_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            buzz_relay::handlers::agent_transfer_delivery_worker::run(transfer_delivery_state).await
+        });
+        info!("Managed-agent transfer delivery worker started");
+    }
+
     // Action recovery worker: re-drives stranded relay_admin_actions rows whose
     // action lease expired before the enforcement state machine completed.
     // Crash safety: a process that died between claim and finalization leaves

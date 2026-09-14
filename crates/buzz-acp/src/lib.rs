@@ -12,6 +12,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod setup_mode;
+mod transfer_supervisor;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -1650,13 +1651,17 @@ fn handle_relay_transfer_coordinator_event(
         );
         return;
     }
+    // The relay admission path enforces the ±5 minute freshness window before
+    // it accepts the owner event into the durable delivery queue. A queued
+    // event may legitimately arrive here much later after the runtime was
+    // offline, so only a future timestamp is unsafe at this boundary.
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).unsigned_abs() > 300 {
+    if event_ts.saturating_sub(now) > 300 {
         tracing::warn!(
             event_ts,
             now,
-            "transfer coordinator request is stale — dropping"
+            "transfer coordinator request is from the future — dropping"
         );
         return;
     }
@@ -1686,6 +1691,21 @@ fn handle_relay_transfer_coordinator_event(
         TransferCoordinatorMessage::OwnerRequest {
             request: TransferOwnerRequest::Start { transfer },
         } if transfer.agent_pubkey == agent_pubkey_hex => {
+            let local_instance_id = std::env::var("BUZZ_MANAGED_AGENT").unwrap_or_default();
+            let decision = transfer_supervisor::decide(&transfer, &local_instance_id);
+            // Keep command planning behind the same pure seam while the real
+            // pool metrics and signed publish adapter are being connected.
+            // Conservative placeholder facts prevent a false quiescence or
+            // readiness report; no command is sent from this preview.
+            let planned_command = transfer_supervisor::command_for(
+                &transfer,
+                &local_instance_id,
+                transfer_supervisor::RuntimeObservation {
+                    active_work: u32::MAX,
+                    accepting_work: true,
+                    ready: false,
+                },
+            );
             tracing::info!(
                 operation_id = %transfer.operation_id,
                 revision = transfer.revision,
@@ -1693,6 +1713,10 @@ fn handle_relay_transfer_coordinator_event(
                 phase = ?transfer.phase,
                 source = %transfer.source.instance_id,
                 target = %transfer.target.instance_id,
+                local_instance_id = %local_instance_id,
+                role = ?decision.role,
+                action = ?decision.action,
+                planned_command = ?planned_command,
                 "validated transfer request at runtime boundary"
             );
         }

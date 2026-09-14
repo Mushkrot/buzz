@@ -681,6 +681,40 @@ CREATE TABLE managed_agent_transfer_journal (
 CREATE INDEX managed_agent_transfer_journal_created_idx
     ON managed_agent_transfer_journal (community_id, agent_pubkey, created_at DESC);
 
+-- Durable retryable transport for signed managed-agent transfer coordinator
+-- events. The transfer state and journal remain authoritative; this table only
+-- prevents an offline target from missing an accepted start request.
+CREATE TABLE managed_agent_transfer_deliveries (
+    id            UUID NOT NULL DEFAULT gen_random_uuid(),
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    agent_pubkey  TEXT NOT NULL CHECK (length(agent_pubkey) BETWEEN 1 AND 256),
+    operation_id  TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+    revision      BIGINT NOT NULL CHECK (revision >= 0),
+    event_id      TEXT NOT NULL CHECK (length(event_id) = 64),
+    event         JSONB NOT NULL CHECK (jsonb_typeof(event) = 'object'),
+    state         TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending', 'delivered', 'failed')),
+    attempt_count INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    retry_after   TIMESTAMPTZ,
+    held_by       TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    claim_token   UUID,
+    error_message TEXT,
+    delivered_at  TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, id),
+    UNIQUE (community_id, agent_pubkey, operation_id, revision),
+    UNIQUE (community_id, event_id)
+);
+
+CREATE INDEX managed_agent_transfer_deliveries_pending_idx
+    ON managed_agent_transfer_deliveries (retry_after, created_at)
+    WHERE state = 'pending';
+
+CREATE INDEX managed_agent_transfer_deliveries_agent_idx
+    ON managed_agent_transfer_deliveries (community_id, agent_pubkey, created_at DESC);
+
 -- ── Audit log ─────────────────────────────────────────────────────────────────
 -- Conformance: "Audit log and observability". Per-community hash chain:
 -- uniqueness (community_id, seq) and (community_id, hash). One chain per tenant.
@@ -1785,6 +1819,7 @@ SELECT attach_community_write_fence('git_repo_names');
 SELECT attach_community_write_fence('join_policy_acceptances');
 SELECT attach_community_write_fence('managed_agent_transfers');
 SELECT attach_community_write_fence('managed_agent_transfer_journal');
+SELECT attach_community_write_fence('managed_agent_transfer_deliveries');
 SELECT attach_community_write_fence('moderation_actions');
 SELECT attach_community_write_fence('moderation_reports');
 SELECT attach_community_write_fence('parameterized_event_watermarks');

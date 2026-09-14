@@ -62,16 +62,17 @@ pub type ExecutorCommandRequest = TransferExecutorCommand;
 /// Subscription identifier used for the best-effort live delivery of a
 /// coordinator request to the target runtime. The event is not persisted or
 /// broadcast as a timeline event; an offline target is handled by the durable
-/// coordinator state and a future outbox/recovery pass.
-const COORDINATOR_DELIVERY_SUB_ID: &str = "agent-transfer-coordinator";
+/// delivery queue and its retry worker.
+pub(crate) const COORDINATOR_DELIVERY_SUB_ID: &str = "agent-transfer-coordinator";
 
 /// Handle one relay-readable signed transfer request.
 ///
-/// The request is intentionally ephemeral: it is authenticated, authorized,
-/// dispatched to the durable coordinator, and answered through the sender's
-/// NIP-01 `OK` frame. It is never stored or fanned out as a public timeline
-/// event. Only public state-machine metadata is accepted; secrets remain on
-/// the encrypted observer-frame path.
+/// The request is intentionally ephemeral as a timeline event: it is
+/// authenticated, authorized, dispatched to the durable coordinator, and
+/// answered through the sender's NIP-01 `OK` frame. A secret-free copy is
+/// retained in the private delivery queue so an offline target can receive it
+/// after reconnecting. Only public state-machine metadata is accepted; secrets
+/// remain on the encrypted observer-frame path.
 pub async fn handle_coordinator_event(
     event: nostr::Event,
     event_id_hex: &str,
@@ -156,12 +157,17 @@ pub async fn handle_coordinator_event(
         }
     }
 
-    let deliver_to_target = matches!(
-        &envelope.message,
+    let transfer_delivery = match &envelope.message {
         TransferCoordinatorMessage::OwnerRequest {
-            request: TransferOwnerRequest::Start { .. }
-        }
-    );
+            request: TransferOwnerRequest::Start { transfer },
+        } => Some((
+            transfer.operation_id.clone(),
+            transfer.revision,
+            transfer.agent_pubkey.clone(),
+        )),
+        _ => None,
+    };
+    let deliver_to_target = transfer_delivery.is_some();
     let response = state
         .transfer_coordinator
         .dispatch_wire(
@@ -172,6 +178,44 @@ pub async fn handle_coordinator_event(
         .await;
     match response {
         Ok(response) => {
+            if let Some((operation_id, revision, agent_pubkey)) = transfer_delivery {
+                let event_json = match serde_json::to_value(&event) {
+                    Ok(event_json) => event_json,
+                    Err(error) => {
+                        tracing::error!(event_id = %event_id_hex, "transfer coordinator event serialization failed: {error}");
+                        conn.send(crate::protocol::RelayMessage::ok(
+                            event_id_hex,
+                            false,
+                            "error: internal server error",
+                        ));
+                        return;
+                    }
+                };
+                if let Err(error) = state
+                    .db
+                    .enqueue_managed_agent_transfer_delivery(
+                        conn.tenant.community(),
+                        &agent_pubkey,
+                        &operation_id,
+                        revision,
+                        &event.id.to_hex(),
+                        event_json,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        event_id = %event_id_hex,
+                        operation_id = %operation_id,
+                        "transfer coordinator delivery queue write failed: {error}"
+                    );
+                    conn.send(crate::protocol::RelayMessage::ok(
+                        event_id_hex,
+                        false,
+                        "error: internal server error",
+                    ));
+                    return;
+                }
+            }
             if deliver_to_target {
                 let delivered = deliver_to_target_connections(
                     &state,
@@ -205,8 +249,8 @@ pub async fn handle_coordinator_event(
 ///
 /// This is intentionally a narrow adapter: the relay does not infer process
 /// state and does not claim delivery when the target is offline. Durable
-/// recovery for that case belongs to the outbox/supervisor seam that consumes
-/// the transfer record.
+/// recovery for that case belongs to the transfer-delivery worker, while
+/// lifecycle decisions remain in the runtime supervisor seam.
 fn deliver_to_target_connections(
     state: &crate::state::AppState,
     community: buzz_core::CommunityId,
