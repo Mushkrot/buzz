@@ -683,13 +683,15 @@ CREATE INDEX managed_agent_transfer_journal_created_idx
 
 -- Durable retryable transport for signed managed-agent transfer coordinator
 -- events. The transfer state and journal remain authoritative; this table only
--- prevents an offline target from missing an accepted start request.
+-- prevents an offline runtime from missing an accepted coordinator event.
 CREATE TABLE managed_agent_transfer_deliveries (
     id            UUID NOT NULL DEFAULT gen_random_uuid(),
     community_id  UUID NOT NULL REFERENCES communities(id),
     agent_pubkey  TEXT NOT NULL CHECK (length(agent_pubkey) BETWEEN 1 AND 256),
     operation_id  TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
     revision      BIGINT NOT NULL CHECK (revision >= 0),
+    message_type  TEXT NOT NULL DEFAULT 'owner_start'
+                  CHECK (length(message_type) BETWEEN 1 AND 64),
     event_id      TEXT NOT NULL CHECK (length(event_id) = 64),
     event         JSONB NOT NULL CHECK (jsonb_typeof(event) = 'object'),
     state         TEXT NOT NULL DEFAULT 'pending'
@@ -704,7 +706,7 @@ CREATE TABLE managed_agent_transfer_deliveries (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (community_id, id),
-    UNIQUE (community_id, agent_pubkey, operation_id, revision),
+    UNIQUE (community_id, agent_pubkey, operation_id, revision, message_type),
     UNIQUE (community_id, event_id)
 );
 

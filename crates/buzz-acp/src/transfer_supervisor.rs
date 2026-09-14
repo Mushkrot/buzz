@@ -124,6 +124,11 @@ pub(crate) fn command_for(
         {
             Some(buzz_core::agent_transfer::TransferCommand::ConfirmTarget)
         }
+        (RuntimeRole::Target, TransferPhase::Verifying, SupervisorAction::VerifyTarget)
+            if observation.ready =>
+        {
+            Some(buzz_core::agent_transfer::TransferCommand::Complete)
+        }
         _ => None,
     }
 }
@@ -231,6 +236,18 @@ mod tests {
                 },
             ),
             Some(buzz_core::agent_transfer::TransferCommand::ConfirmTarget)
+        );
+        transfer.phase = TransferPhase::Verifying;
+        assert_eq!(
+            command_for(
+                &transfer,
+                "target-1",
+                RuntimeObservation {
+                    ready: true,
+                    ..RuntimeObservation::default()
+                },
+            ),
+            Some(buzz_core::agent_transfer::TransferCommand::Complete)
         );
     }
 

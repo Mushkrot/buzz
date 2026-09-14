@@ -630,6 +630,28 @@ impl EventQueue {
         self.queues.len()
     }
 
+    /// Number of events that still represent local work.
+    ///
+    /// This is used by the managed-agent transfer supervisor as a conservative
+    /// quiescence observation. It includes queued events, cancelled batches,
+    /// and withheld native-steer events, but not already-completed history.
+    pub fn pending_event_count(&self) -> usize {
+        self.queues
+            .values()
+            .map(|events| events.len())
+            .sum::<usize>()
+            + self
+                .cancelled_batches
+                .values()
+                .map(|events| events.len())
+                .sum::<usize>()
+            + self
+                .withheld_native_steer
+                .values()
+                .map(|events| events.len())
+                .sum::<usize>()
+    }
+
     /// Number of queued events for a specific channel. Test-only.
     #[cfg(test)]
     pub fn queued_event_count(&self, channel_id: &Uuid) -> usize {

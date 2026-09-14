@@ -113,6 +113,16 @@ const DRAIN_BUDGET_PER_ITER: usize = 1;
 /// (`gated_observer_dropped`). Note each dropped frame may carry a whole batch
 /// of events, so event-level loss is larger than the frame count.
 const GATED_OBSERVER_QUEUE_CAP: usize = 256;
+/// Maximum signed transfer-coordinator events parked while the relay is gated
+/// or disconnected. Transfer commands are state-machine inputs, so they are
+/// retained separately from observer telemetry and never silently treated as
+/// ephemeral typing traffic.
+const GATED_COORDINATOR_QUEUE_CAP: usize = 128;
+/// Relay coordinator events are admitted only inside a five-minute timestamp
+/// window. A parked event that crosses that boundary cannot be republished
+/// without re-signing it, so it is discarded visibly and the supervisor must
+/// re-plan from its current durable snapshot.
+const COORDINATOR_EVENT_MAX_AGE_SECS: u64 = 240;
 
 use std::time::Instant;
 
@@ -1223,6 +1233,10 @@ struct BgState {
     /// relay's rate-limit NOTICE does not carry an event ID, so all unresolved
     /// observer writes are moved back ahead of the parked FIFO when one arrives.
     observer_in_flight: VecDeque<Box<Event>>,
+    /// Signed transfer-coordinator events parked while the socket is gated or
+    /// unavailable. Drained before observer telemetry so lifecycle commands do
+    /// not wait behind diagnostic traffic.
+    coordinator_pending: VecDeque<Box<Event>>,
     /// Frames evicted from the bounded pending/in-flight observer buffers since
     /// summary log. Makes overflow loss visible instead of silent.
     gated_observer_dropped: u64,
@@ -1266,6 +1280,7 @@ impl BgState {
             transfer_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
+            coordinator_pending: VecDeque::new(),
             gated_observer_dropped: 0,
             resubscribe_retry: HashSet::new(),
             connection_generation: 0,
@@ -1442,6 +1457,18 @@ impl BgState {
         self.observer_in_flight.push_back(event);
     }
 
+    /// Park a signed coordinator event with a visible bounded-overflow policy.
+    fn park_coordinator_event(&mut self, event: Box<Event>) {
+        if self.coordinator_pending.len() >= GATED_COORDINATOR_QUEUE_CAP {
+            warn!(
+                pending = self.coordinator_pending.len(),
+                "transfer coordinator queue full — dropping oldest event"
+            );
+            self.coordinator_pending.pop_front();
+        }
+        self.coordinator_pending.push_back(event);
+    }
+
     fn acknowledge_observer_frame(&mut self, event_id: &str) {
         if let Some(index) = self
             .observer_in_flight
@@ -1457,8 +1484,9 @@ impl BgState {
 ///
 /// Subscribe/Unsubscribe/SubscribeMembership record intent so reconnect
 /// restores the right subscriptions. SetStartupWatermark floors the replay
-/// window. Observer telemetry publishes are parked for post-reconnect drain;
-/// other PublishEvent and Reconnect are no-ops while disconnected.
+/// window. Observer telemetry and transfer-coordinator publishes are parked
+/// for post-reconnect drain; other PublishEvent and Reconnect are no-ops while
+/// disconnected.
 ///
 /// Callers MUST handle `Shutdown` before calling — reaching the Shutdown
 /// arm here is a logic error.
@@ -1501,13 +1529,16 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 state.membership_last_seen = Some(ts);
             }
         }
-        // Observer telemetry frames are durable: park them (bounded, visible
-        // overflow) so they are delivered by the post-reconnect drain. Other
-        // ephemeral publishes (typing indicators) are meaningless while
-        // disconnected and are dropped.
+        // Observer telemetry and transfer-coordinator frames are durable: park
+        // them (bounded, visible overflow) so they are delivered by the
+        // post-reconnect drain. Other ephemeral publishes (typing indicators)
+        // are meaningless while disconnected and are dropped.
         RelayCommand::PublishEvent { event } => {
             if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME {
                 state.park_gated_observer_frame(event);
+            } else if event.kind.as_u16() as u32 == buzz_core::kind::KIND_AGENT_TRANSFER_COORDINATOR
+            {
+                state.park_coordinator_event(event);
             }
         }
         // Already reconnecting — redundant.
@@ -1524,9 +1555,10 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
 
 /// Retain command intent after a live send failure.
 ///
-/// Subscription state must survive reconnect. Observer telemetry publishes are
-/// parked for post-reconnect drain; other ephemeral publishes are deliberately
-/// discarded because replaying a typing indicator after reconnect is meaningless.
+/// Subscription state must survive reconnect. Observer telemetry and
+/// coordinator publishes are parked for post-reconnect drain; other ephemeral
+/// publishes are deliberately discarded because replaying a typing indicator
+/// after reconnect is meaningless.
 /// `Shutdown` and `Reconnect` are handled by the caller.
 fn retain_failed_command_intent(state: &mut BgState, cmd: RelayCommand) {
     match cmd {
@@ -1534,6 +1566,11 @@ fn retain_failed_command_intent(state: &mut BgState, cmd: RelayCommand) {
             if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME =>
         {
             state.park_gated_observer_frame(event);
+        }
+        RelayCommand::PublishEvent { event }
+            if event.kind.as_u16() as u32 == buzz_core::kind::KIND_AGENT_TRANSFER_COORDINATOR =>
+        {
+            state.park_coordinator_event(event);
         }
         RelayCommand::PublishEvent { .. } => {}
         cmd => apply_command_to_state(state, cmd),
@@ -1707,6 +1744,29 @@ async fn execute_connected_command(
             }
         }
         RelayCommand::PublishEvent { event } => {
+            let is_coordinator =
+                event.kind.as_u16() as u32 == buzz_core::kind::KIND_AGENT_TRANSFER_COORDINATOR;
+            if is_coordinator {
+                let age = unix_now_secs().saturating_sub(event.created_at.as_secs());
+                if age > COORDINATOR_EVENT_MAX_AGE_SECS {
+                    warn!(
+                        event_id = %event.id,
+                        age_secs = age,
+                        "dropping expired transfer coordinator event; supervisor must re-plan"
+                    );
+                    return true;
+                }
+                // Coordinator events are durable state-machine inputs. Preserve
+                // FIFO order and never let a gate turn them into silent drops.
+                if state.check_rate_gate().is_some() || !state.coordinator_pending.is_empty() {
+                    debug!(
+                        pending = state.coordinator_pending.len(),
+                        "rate-gated: parking transfer coordinator event"
+                    );
+                    state.park_coordinator_event(event);
+                    return true;
+                }
+            }
             // Observer telemetry frames (kind 24200) are durable telemetry, not
             // droppable ephemera: park them while the rate-limit gate is armed —
             // and while earlier parked frames are still draining, so relative
@@ -1732,6 +1792,10 @@ async fn execute_connected_command(
             // publishes durable events through this path, it must extend the
             // kind guard above to avoid silently discarding user data.
             if state.check_rate_gate().is_some() {
+                if is_coordinator {
+                    state.park_coordinator_event(event);
+                    return true;
+                }
                 debug!("rate-gated: dropping ephemeral PublishEvent (typing indicator)");
                 return true;
             }
@@ -1745,6 +1809,8 @@ async fn execute_connected_command(
                 }
             } else if is_observer {
                 state.park_gated_observer_frame(event);
+            } else if is_coordinator {
+                state.park_coordinator_event(event);
             }
             true
         }
@@ -2014,6 +2080,14 @@ async fn run_background_task(
                 }
             }
 
+            if budget > 0 && !state.coordinator_pending.is_empty() {
+                let sent = drain_coordinator_pending(&mut ws, &mut state, budget).await;
+                if sent > 0 {
+                    any_sent = true;
+                    budget = budget.saturating_sub(sent);
+                }
+            }
+
             if budget > 0 && !state.gated_observer_pending.is_empty() {
                 let sent = drain_gated_observer_pending(&mut ws, &mut state, budget).await;
                 if sent > 0 {
@@ -2023,7 +2097,9 @@ async fn run_background_task(
 
             if any_sent {
                 drain_pacing_next = Some(tokio::time::Instant::now() + REQ_PACING_INTERVAL);
-            } else if !state.gated_observer_pending.is_empty() {
+            } else if !state.gated_observer_pending.is_empty()
+                || !state.coordinator_pending.is_empty()
+            {
                 // Nothing sent because the gate is still armed. Arm the pacing
                 // timer to the gate deadline so parked observer frames drain
                 // promptly even when no other traffic wakes the select loop.
@@ -2961,6 +3037,38 @@ async fn drain_gated_observer_pending(
             "observer frames lost to gated-queue overflow"
         );
         state.gated_observer_dropped = 0;
+    }
+    sent
+}
+
+/// Drain parked transfer-coordinator events once the relay gate clears.
+///
+/// The relay accepts these events only within its freshness window. Expired
+/// entries are dropped with an explicit log; the local supervisor is expected
+/// to observe its durable snapshot and publish a freshly signed command.
+async fn drain_coordinator_pending(ws: &mut WsStream, state: &mut BgState, budget: usize) -> usize {
+    let mut sent = 0;
+    while sent < budget {
+        if state.check_rate_gate().is_some() {
+            break;
+        }
+        let Some(event) = state.coordinator_pending.pop_front() else {
+            break;
+        };
+        let age = unix_now_secs().saturating_sub(event.created_at.as_secs());
+        if age > COORDINATOR_EVENT_MAX_AGE_SECS {
+            warn!(
+                event_id = %event.id,
+                age_secs = age,
+                "dropping expired parked transfer coordinator event; supervisor must re-plan"
+            );
+            continue;
+        }
+        if !send_publish_event_frame(ws, &event).await {
+            state.coordinator_pending.push_front(event);
+            break;
+        }
+        sent += 1;
     }
     sent
 }

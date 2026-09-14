@@ -24,7 +24,8 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::agent_transfer::{
-    TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferOwnerRequest,
+    TransferCommand, TransferCoordinatorEnvelope, TransferCoordinatorMessage,
+    TransferExecutorCommand, TransferOwnerRequest, TransferRecord,
 };
 use buzz_core::kind::{
     KIND_AGENT_TRANSFER_COORDINATOR, KIND_MEMBER_ADDED_NOTIFICATION,
@@ -42,7 +43,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
-use nostr::{PublicKey, ToBech32};
+use nostr::{Event, EventBuilder, Kind, PublicKey, Tag, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
@@ -1623,33 +1624,40 @@ fn handle_relay_observer_control_event(
     }
 }
 
+/// A transfer event that passed the runtime's independent wire and signer
+/// checks. The state machine is applied only by the main loop, after the
+/// WebSocket receive borrow has ended and a real pool observation is available.
+#[derive(Debug)]
+enum ValidatedTransferEvent {
+    OwnerStart {
+        event_id: String,
+        transfer: Box<TransferRecord>,
+    },
+    ExecutorCommand {
+        event_id: String,
+        command: TransferExecutorCommand,
+    },
+}
+
 /// Validate a relay-routed transfer request at the runtime boundary.
 ///
 /// This is deliberately a receive seam, not the process supervisor itself:
-/// the supervisor must decide when an executor is drained or activated and
-/// report those fenced transitions back through the coordinator. Keeping wire
+/// the supervisor decides when an executor is drained or activated and reports
+/// those fenced transitions back through the coordinator. Keeping wire
 /// validation here means malformed or replayed requests never reach pool
-/// lifecycle code while the next supervisor slice is developed and tested.
-fn handle_relay_transfer_coordinator_event(
+/// lifecycle code.
+fn validate_relay_transfer_coordinator_event(
     event: nostr::Event,
     agent_pubkey_hex: &str,
     owner_pubkey_hex: &str,
-) {
+) -> Option<ValidatedTransferEvent> {
     if event.kind.as_u16() as u32 != KIND_AGENT_TRANSFER_COORDINATOR {
         tracing::warn!("unexpected event kind on transfer coordinator channel");
-        return;
+        return None;
     }
     if let Err(error) = buzz_core::verify_event(&event) {
         tracing::warn!(error = %error, "transfer coordinator request failed signature verification");
-        return;
-    }
-    if event.pubkey.to_hex() != owner_pubkey_hex {
-        tracing::warn!(
-            sender = %event.pubkey,
-            expected = %owner_pubkey_hex,
-            "transfer coordinator request from non-owner — dropping"
-        );
-        return;
+        return None;
     }
     // The relay admission path enforces the ±5 minute freshness window before
     // it accepts the owner event into the durable delivery queue. A queued
@@ -1663,13 +1671,13 @@ fn handle_relay_transfer_coordinator_event(
             now,
             "transfer coordinator request is from the future — dropping"
         );
-        return;
+        return None;
     }
     let (tagged_owner, tagged_agent) = match transfer_coordinator_tags(&event) {
         Ok(tags) => tags,
         Err(error) => {
             tracing::warn!(error = %error, "transfer coordinator request has invalid routing tags");
-            return;
+            return None;
         }
     };
     if tagged_owner != owner_pubkey_hex || tagged_agent != agent_pubkey_hex {
@@ -1678,54 +1686,269 @@ fn handle_relay_transfer_coordinator_event(
             tagged_agent,
             "transfer coordinator request is not addressed to this runtime"
         );
-        return;
+        return None;
     }
     let envelope = match TransferCoordinatorEnvelope::from_json(&event.content) {
         Ok(envelope) => envelope,
         Err(error) => {
             tracing::warn!(error = %error, "transfer coordinator request payload is invalid");
-            return;
+            return None;
         }
     };
+    let event_id = event.id.to_hex();
     match envelope.message {
         TransferCoordinatorMessage::OwnerRequest {
             request: TransferOwnerRequest::Start { transfer },
-        } if transfer.agent_pubkey == agent_pubkey_hex => {
-            let local_instance_id = std::env::var("BUZZ_MANAGED_AGENT").unwrap_or_default();
-            let decision = transfer_supervisor::decide(&transfer, &local_instance_id);
-            // Keep command planning behind the same pure seam while the real
-            // pool metrics and signed publish adapter are being connected.
-            // Conservative placeholder facts prevent a false quiescence or
-            // readiness report; no command is sent from this preview.
-            let planned_command = transfer_supervisor::command_for(
-                &transfer,
-                &local_instance_id,
-                transfer_supervisor::RuntimeObservation {
-                    active_work: u32::MAX,
-                    accepting_work: true,
-                    ready: false,
-                },
-            );
-            tracing::info!(
-                operation_id = %transfer.operation_id,
-                revision = transfer.revision,
-                epoch = transfer.epoch,
-                phase = ?transfer.phase,
-                source = %transfer.source.instance_id,
-                target = %transfer.target.instance_id,
-                local_instance_id = %local_instance_id,
-                role = ?decision.role,
-                action = ?decision.action,
-                planned_command = ?planned_command,
-                "validated transfer request at runtime boundary"
-            );
+        } => {
+            if event.pubkey.to_hex() != owner_pubkey_hex {
+                tracing::warn!(
+                    sender = %event.pubkey,
+                    expected = %owner_pubkey_hex,
+                    "transfer owner request from non-owner — dropping"
+                );
+                return None;
+            }
+            if transfer.agent_pubkey != agent_pubkey_hex {
+                tracing::warn!("transfer coordinator request targets another agent — dropping");
+                return None;
+            }
+            Some(ValidatedTransferEvent::OwnerStart { event_id, transfer })
         }
         TransferCoordinatorMessage::OwnerRequest { .. } => {
-            tracing::warn!("transfer coordinator owner request targets another agent — dropping");
+            tracing::debug!("ignoring transfer owner request that is not a start event");
+            None
         }
-        TransferCoordinatorMessage::ExecutorCommand { .. } => {
-            tracing::warn!("executor command is not accepted on the owner delivery channel");
+        TransferCoordinatorMessage::ExecutorCommand { command } => {
+            if event.pubkey.to_hex() != agent_pubkey_hex {
+                tracing::warn!(
+                    sender = %event.pubkey,
+                    expected = %agent_pubkey_hex,
+                    "transfer executor command from non-agent — dropping"
+                );
+                return None;
+            }
+            if command.agent_pubkey != agent_pubkey_hex {
+                tracing::warn!("transfer executor command targets another agent — dropping");
+                return None;
+            }
+            Some(ValidatedTransferEvent::ExecutorCommand { event_id, command })
         }
+    }
+}
+
+/// Build a freshly signed public executor command event.
+fn build_transfer_executor_event(
+    keys: &nostr::Keys,
+    owner_pubkey_hex: &str,
+    command: &TransferExecutorCommand,
+) -> Result<Event> {
+    let envelope = TransferCoordinatorEnvelope::new(
+        Uuid::new_v4().to_string(),
+        TransferCoordinatorMessage::ExecutorCommand {
+            command: command.clone(),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("transfer command envelope: {error}"))?;
+    let owner_tag = Tag::parse(["p", owner_pubkey_hex])
+        .map_err(|error| anyhow::anyhow!("transfer owner tag: {error}"))?;
+    let agent_tag = Tag::parse(["agent", &command.agent_pubkey])
+        .map_err(|error| anyhow::anyhow!("transfer agent tag: {error}"))?;
+    EventBuilder::new(
+        Kind::Custom(KIND_AGENT_TRANSFER_COORDINATOR as u16),
+        envelope
+            .to_json()
+            .map_err(|error| anyhow::anyhow!("transfer command serialization: {error}"))?,
+    )
+    .tags([owner_tag, agent_tag])
+    .allow_self_tagging()
+    .sign_with_keys(keys)
+    .map_err(|error| anyhow::anyhow!("transfer command signing: {error}"))
+}
+
+/// Local, replay-safe view of the transfer record used by one runtime.
+#[derive(Debug)]
+struct LocalTransferState {
+    record: TransferRecord,
+    seen_event_ids: HashSet<String>,
+    /// Once the source has emitted `BeginDrain`, new channel work is rejected
+    /// locally while already-running turns are allowed to finish.
+    draining: bool,
+    /// A command is planned at most once for one observed revision. If relay
+    /// publication fails, this remains unset so the next observation retries.
+    last_planned_revision: Option<u64>,
+}
+
+impl LocalTransferState {
+    fn from_start(event_id: String, transfer: TransferRecord) -> Self {
+        let mut seen_event_ids = HashSet::new();
+        seen_event_ids.insert(event_id);
+        Self {
+            record: transfer,
+            seen_event_ids,
+            draining: false,
+            last_planned_revision: None,
+        }
+    }
+
+    fn apply_command(
+        &mut self,
+        event_id: String,
+        command: TransferExecutorCommand,
+        local_instance_id: &str,
+    ) -> Result<bool, String> {
+        if !self.seen_event_ids.insert(event_id) {
+            return Ok(false);
+        }
+        if command.operation_id != self.record.operation_id {
+            return Err("executor command belongs to another transfer operation".into());
+        }
+        self.record
+            .apply(
+                command.expected_revision,
+                command.expected_epoch,
+                command.command.clone(),
+            )
+            .map_err(|error| format!("transfer command rejected locally: {error}"))?;
+        if command.executor_instance_id == local_instance_id
+            && matches!(command.command, TransferCommand::BeginDrain)
+        {
+            self.draining = true;
+        }
+        if self.record.source.instance_id == local_instance_id
+            && self.record.phase == buzz_core::agent_transfer::TransferPhase::Draining
+        {
+            self.draining = true;
+        }
+        Ok(true)
+    }
+}
+
+/// Observe real harness work and publish one fenced command when the pure
+/// supervisor says the runtime has enough evidence to advance the transfer.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_plan_transfer_command(
+    state: &mut LocalTransferState,
+    local_instance_id: &str,
+    pool: &AgentPool,
+    queue: &EventQueue,
+    pool_ready: bool,
+    keys: &nostr::Keys,
+    owner_pubkey_hex: &str,
+    publisher: &RelayEventPublisher,
+) {
+    if state.last_planned_revision == Some(state.record.revision) {
+        return;
+    }
+    let active_work = pool
+        .task_map()
+        .len()
+        .saturating_add(queue.pending_event_count());
+    let observation = transfer_supervisor::RuntimeObservation {
+        active_work: active_work.min(u32::MAX as usize) as u32,
+        accepting_work: !state.draining,
+        ready: pool_ready && pool.live_count() > 0,
+    };
+    let Some(command) =
+        transfer_supervisor::command_for(&state.record, local_instance_id, observation)
+    else {
+        return;
+    };
+    if matches!(command, TransferCommand::BeginDrain) {
+        state.draining = true;
+    }
+    let request = TransferExecutorCommand {
+        agent_pubkey: state.record.agent_pubkey.clone(),
+        operation_id: state.record.operation_id.clone(),
+        executor_instance_id: local_instance_id.to_owned(),
+        expected_revision: state.record.revision,
+        expected_epoch: state.record.epoch,
+        command,
+    };
+    match build_transfer_executor_event(keys, owner_pubkey_hex, &request) {
+        Ok(event) => match publisher.publish_event(event).await {
+            Ok(()) => {
+                state.last_planned_revision = Some(state.record.revision);
+                tracing::info!(
+                    operation_id = %state.record.operation_id,
+                    revision = state.record.revision,
+                    command = ?request.command,
+                    instance = %local_instance_id,
+                    "published managed-agent transfer command"
+                );
+            }
+            Err(error) => tracing::warn!(
+                operation_id = %state.record.operation_id,
+                revision = state.record.revision,
+                "could not queue managed-agent transfer command: {error}"
+            ),
+        },
+        Err(error) => tracing::warn!("could not build managed-agent transfer command: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod transfer_runtime_tests {
+    use super::*;
+    use buzz_core::agent_transfer::Executor;
+
+    fn transfer(agent: &str) -> TransferRecord {
+        TransferRecord::new(
+            "community",
+            agent,
+            "operation",
+            Executor::new("source", "server").expect("source"),
+            Executor::new("target", "computer").expect("target"),
+            1,
+        )
+        .expect("transfer")
+    }
+
+    #[test]
+    fn executor_command_event_is_signed_and_runtime_validated() {
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let command = TransferExecutorCommand {
+            agent_pubkey: agent.public_key().to_hex(),
+            operation_id: "operation".into(),
+            executor_instance_id: "source".into(),
+            expected_revision: 0,
+            expected_epoch: 1,
+            command: TransferCommand::BeginDrain,
+        };
+        let event = build_transfer_executor_event(&agent, &owner.public_key().to_hex(), &command)
+            .expect("build command event");
+        let validated = validate_relay_transfer_coordinator_event(
+            event,
+            &agent.public_key().to_hex(),
+            &owner.public_key().to_hex(),
+        );
+        assert!(matches!(
+            validated,
+            Some(ValidatedTransferEvent::ExecutorCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn local_state_applies_fenced_command_once() {
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let mut state = LocalTransferState::from_start("start-event".into(), transfer(&agent_hex));
+        let command = TransferExecutorCommand {
+            agent_pubkey: agent_hex,
+            operation_id: "operation".into(),
+            executor_instance_id: "source".into(),
+            expected_revision: 0,
+            expected_epoch: 1,
+            command: TransferCommand::BeginDrain,
+        };
+        assert!(state
+            .apply_command("command-event".into(), command.clone(), "source")
+            .expect("apply command"));
+        assert_eq!(state.record.revision, 1);
+        assert!(state.draining);
+        assert!(!state
+            .apply_command("command-event".into(), command, "source")
+            .expect("deduplicate command"));
     }
 }
 
@@ -3010,6 +3233,13 @@ async fn tokio_main() -> Result<()> {
         })
         .collect();
 
+    // Stable executor identity for this runtime. Transfer commands are signed
+    // by the managed agent key but fenced by this instance id, so two runtimes
+    // sharing one agent identity cannot accidentally advance each other's role.
+    let local_transfer_instance_id =
+        std::env::var("BUZZ_MANAGED_AGENT").unwrap_or_else(|_| pubkey_hex.clone());
+    let mut local_transfer_state: Option<LocalTransferState> = None;
+
     //
     // Branches 1 & 2 both need to borrow `pool`, but they access different
     // fields (result_rx vs join_set). We use `rx_and_join_set()` to split the
@@ -3019,6 +3249,7 @@ async fn tokio_main() -> Result<()> {
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
+        Transfer(ValidatedTransferEvent),
     }
 
     loop {
@@ -3223,17 +3454,21 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx;
                     match control_event {
                         Some(event) => {
-                            if event.kind.as_u16() as u32 == KIND_AGENT_TRANSFER_COORDINATOR {
+                            let pool_event = if event.kind.as_u16() as u32
+                                == KIND_AGENT_TRANSFER_COORDINATOR
+                            {
                                 if let Some(ref owner_hex) = owner_cache.pubkey {
-                                    handle_relay_transfer_coordinator_event(
+                                    validate_relay_transfer_coordinator_event(
                                         event,
                                         &pubkey_hex,
                                         owner_hex,
-                                    );
+                                    )
+                                    .map(PoolEvent::Transfer)
                                 } else {
                                     tracing::warn!(
                                         "transfer coordinator request received but no owner resolved — dropping"
                                     );
+                                    None
                                 }
                             } else if let Some(ref owner_hex) = owner_cache.pubkey {
                                 handle_relay_observer_control_event(
@@ -3244,16 +3479,19 @@ async fn tokio_main() -> Result<()> {
                                     owner_hex,
                                     relay.event_publisher(),
                                 );
+                                None
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
-                            }
+                                None
+                            };
+                            pool_event
                         }
                         None => {
                             relay_observer_control_rx = None;
                             tracing::warn!("relay observer control channel closed");
+                            None
                         }
                     }
-                    None
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 buzz_event = relay.next_event() => {
@@ -3484,6 +3722,17 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                                 // Not from owner — fall through to normal prompt handling.
+                            }
+
+                            if local_transfer_state
+                                .as_ref()
+                                .is_some_and(|state| state.draining)
+                            {
+                                tracing::info!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "dropping new channel event while transfer source is draining"
+                                );
+                                continue;
                             }
 
                             // Coarse security policy: drop events from disallowed
@@ -3741,6 +3990,21 @@ async fn tokio_main() -> Result<()> {
                 {
                     typing_channels.insert(channel_id, thread_tags);
                 }
+                if let (Some(state), Some(owner_hex)) =
+                    (local_transfer_state.as_mut(), owner_cache.get())
+                {
+                    maybe_plan_transfer_command(
+                        state,
+                        &local_transfer_instance_id,
+                        &pool,
+                        &queue,
+                        pool_ready,
+                        &config.keys,
+                        owner_hex,
+                        &relay.event_publisher(),
+                    )
+                    .await;
+                }
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
@@ -3765,6 +4029,75 @@ async fn tokio_main() -> Result<()> {
                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                 {
                     typing_channels.insert(channel_id, thread_tags);
+                }
+            }
+            Some(PoolEvent::Transfer(event)) => {
+                match event {
+                    ValidatedTransferEvent::OwnerStart { event_id, transfer } => {
+                        let replace = match local_transfer_state.as_ref() {
+                            None => true,
+                            Some(current)
+                                if current.record.operation_id == transfer.operation_id =>
+                            {
+                                transfer.revision > current.record.revision
+                            }
+                            Some(current) => current.record.phase.is_terminal(),
+                        };
+                        if replace {
+                            let mut next = LocalTransferState::from_start(event_id, *transfer);
+                            if next.record.source.instance_id == local_transfer_instance_id
+                                && next.record.phase
+                                    == buzz_core::agent_transfer::TransferPhase::Draining
+                            {
+                                next.draining = true;
+                            }
+                            local_transfer_state = Some(next);
+                        } else if let Some(current) = local_transfer_state.as_mut() {
+                            current.seen_event_ids.insert(event_id);
+                            tracing::debug!(
+                                operation_id = %current.record.operation_id,
+                                revision = current.record.revision,
+                                "ignoring duplicate or older transfer start"
+                            );
+                        }
+                    }
+                    ValidatedTransferEvent::ExecutorCommand { event_id, command } => {
+                        if let Some(current) = local_transfer_state.as_mut() {
+                            match current.apply_command(
+                                event_id,
+                                command,
+                                &local_transfer_instance_id,
+                            ) {
+                                Ok(true) => tracing::info!(
+                                    operation_id = %current.record.operation_id,
+                                    revision = current.record.revision,
+                                    phase = ?current.record.phase,
+                                    "applied managed-agent transfer command locally"
+                                ),
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!("{error}"),
+                            }
+                        } else {
+                            tracing::warn!(
+                                "received transfer command before its owner start snapshot"
+                            );
+                        }
+                    }
+                }
+                if let (Some(state), Some(owner_hex)) =
+                    (local_transfer_state.as_mut(), owner_cache.get())
+                {
+                    maybe_plan_transfer_command(
+                        state,
+                        &local_transfer_instance_id,
+                        &pool,
+                        &queue,
+                        pool_ready,
+                        &config.keys,
+                        owner_hex,
+                        &relay.event_publisher(),
+                    )
+                    .await;
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {

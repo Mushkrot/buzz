@@ -699,7 +699,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 43);
+        assert_eq!(migrations.len(), 44);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1268,6 +1268,12 @@ mod tests {
             .contains("CREATE TABLE managed_agent_transfer_deliveries"));
         assert!(managed_agent_transfer_deliveries.contains("UNIQUE (community_id, event_id)"));
         assert!(managed_agent_transfer_deliveries.contains("attach_community_write_fence"));
+
+        assert_eq!(migrations[43].version, 44);
+        let managed_agent_transfer_delivery_types = migrations[43].sql.as_str();
+        assert!(managed_agent_transfer_delivery_types.contains("message_type"));
+        assert!(managed_agent_transfer_delivery_types
+            .contains("UNIQUE (community_id, agent_pubkey, operation_id, revision, message_type)"));
     }
 
     #[test]

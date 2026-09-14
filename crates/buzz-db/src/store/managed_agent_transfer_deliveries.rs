@@ -27,6 +27,9 @@ pub struct ManagedAgentTransferDelivery {
     pub operation_id: String,
     /// State-machine revision represented by the event.
     pub revision: u64,
+    /// Delivery class used to keep an owner start distinct from an executor
+    /// command that observes the same state-machine revision.
+    pub message_type: String,
     /// Signed coordinator event id in canonical lowercase hex.
     pub event_id: String,
     /// Serialized signed coordinator event.
@@ -46,20 +49,24 @@ pub struct ManagedAgentTransferDelivery {
 /// Maximum number of offline/malformed delivery attempts before terminal failure.
 pub const TRANSFER_DELIVERY_MAX_ATTEMPTS: i32 = 10;
 
-/// Enqueue one signed coordinator event exactly once for an operation revision.
+/// Enqueue one signed coordinator event exactly once for an operation revision
+/// and delivery class.
 ///
 /// Returning `true` means a new row was inserted. Retrying the same operation
-/// revision is a no-op, which makes owner retries safe after a relay crash.
+/// revision and message type is a no-op, which makes owner retries safe after a
+/// relay crash while keeping an executor command at the same revision distinct.
 #[datastore_span(
     name = "managed_agent_transfer_delivery_enqueue",
     system = "postgresql"
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn enqueue(
     pool: &PgPool,
     community_id: CommunityId,
     agent_pubkey: &str,
     operation_id: &str,
     revision: u64,
+    message_type: &str,
     event_id: &str,
     event: serde_json::Value,
 ) -> Result<bool> {
@@ -71,15 +78,17 @@ pub async fn enqueue(
     let result = sqlx::query(
         r#"
         INSERT INTO managed_agent_transfer_deliveries
-            (community_id, agent_pubkey, operation_id, revision, event_id, event)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (community_id, agent_pubkey, operation_id, revision) DO NOTHING
+            (community_id, agent_pubkey, operation_id, revision, message_type, event_id, event)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (community_id, agent_pubkey, operation_id, revision, message_type)
+        DO NOTHING
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(agent_pubkey)
     .bind(operation_id)
     .bind(revision)
+    .bind(message_type)
     .bind(event_id)
     .bind(event)
     .execute(pool)
@@ -122,7 +131,7 @@ pub async fn claim_batch(
               AND state = 'pending'
               AND (lease_expires_at IS NULL OR lease_expires_at < now())
             RETURNING id, community_id, agent_pubkey, operation_id, revision,
-                      event_id, event, state, attempt_count, error_message,
+                      message_type, event_id, event, state, attempt_count, error_message,
                       claim_token, created_at
             "#,
         )
@@ -198,6 +207,7 @@ fn row_to_delivery(row: sqlx::postgres::PgRow) -> Result<ManagedAgentTransferDel
                 "stored transfer delivery revision cannot be negative".into(),
             )
         })?,
+        message_type: row.try_get("message_type")?,
         event_id: row.try_get("event_id")?,
         event: row.try_get("event")?,
         state: row.try_get("state")?,
@@ -216,12 +226,14 @@ fn row_to_delivery(row: sqlx::postgres::PgRow) -> Result<ManagedAgentTransferDel
 
 impl Db {
     /// Enqueue one transfer coordinator event idempotently.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_managed_agent_transfer_delivery(
         &self,
         community_id: CommunityId,
         agent_pubkey: &str,
         operation_id: &str,
         revision: u64,
+        message_type: &str,
         event_id: &str,
         event: serde_json::Value,
     ) -> Result<bool> {
@@ -231,6 +243,7 @@ impl Db {
             agent_pubkey,
             operation_id,
             revision,
+            message_type,
             event_id,
             event,
         )

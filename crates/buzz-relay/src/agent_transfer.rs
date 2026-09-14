@@ -67,10 +67,10 @@ pub(crate) const COORDINATOR_DELIVERY_SUB_ID: &str = "agent-transfer-coordinator
 
 /// Handle one relay-readable signed transfer request.
 ///
-/// The request is intentionally ephemeral as a timeline event: it is
+/// The event is intentionally ephemeral as a timeline event: it is
 /// authenticated, authorized, dispatched to the durable coordinator, and
 /// answered through the sender's NIP-01 `OK` frame. A secret-free copy is
-/// retained in the private delivery queue so an offline target can receive it
+/// retained in the private delivery queue so an offline runtime can receive it
 /// after reconnecting. Only public state-machine metadata is accepted; secrets
 /// remain on the encrypted observer-frame path.
 pub async fn handle_coordinator_event(
@@ -164,6 +164,13 @@ pub async fn handle_coordinator_event(
             transfer.operation_id.clone(),
             transfer.revision,
             transfer.agent_pubkey.clone(),
+            "owner_start",
+        )),
+        TransferCoordinatorMessage::ExecutorCommand { command } => Some((
+            command.operation_id.clone(),
+            command.expected_revision,
+            command.agent_pubkey.clone(),
+            "executor_command",
         )),
         _ => None,
     };
@@ -178,7 +185,7 @@ pub async fn handle_coordinator_event(
         .await;
     match response {
         Ok(response) => {
-            if let Some((operation_id, revision, agent_pubkey)) = transfer_delivery {
+            if let Some((operation_id, revision, agent_pubkey, message_type)) = transfer_delivery {
                 let event_json = match serde_json::to_value(&event) {
                     Ok(event_json) => event_json,
                     Err(error) => {
@@ -198,6 +205,7 @@ pub async fn handle_coordinator_event(
                         &agent_pubkey,
                         &operation_id,
                         revision,
+                        message_type,
                         &event.id.to_hex(),
                         event_json,
                     )
@@ -245,7 +253,7 @@ pub async fn handle_coordinator_event(
     }
 }
 
-/// Deliver a coordinator start request to active target sockets.
+/// Deliver an accepted coordinator event to active runtime sockets.
 ///
 /// This is intentionally a narrow adapter: the relay does not infer process
 /// state and does not claim delivery when the target is offline. Durable

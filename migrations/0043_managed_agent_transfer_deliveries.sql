@@ -1,6 +1,6 @@
 -- Durable, retryable transport for signed managed-agent transfer coordinator
 -- events. The transfer state and journal remain authoritative; this table only
--- prevents an offline target from missing an accepted start request.
+-- prevents an offline runtime from missing an accepted coordinator event.
 
 CREATE TABLE managed_agent_transfer_deliveries (
     id            UUID NOT NULL DEFAULT gen_random_uuid(),
