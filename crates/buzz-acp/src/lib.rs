@@ -22,9 +22,13 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
+use buzz_core::agent_transfer::{
+    TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferOwnerRequest,
+};
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_AGENT_TRANSFER_COORDINATOR, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+    KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -1618,6 +1622,116 @@ fn handle_relay_observer_control_event(
     }
 }
 
+/// Validate a relay-routed transfer request at the runtime boundary.
+///
+/// This is deliberately a receive seam, not the process supervisor itself:
+/// the supervisor must decide when an executor is drained or activated and
+/// report those fenced transitions back through the coordinator. Keeping wire
+/// validation here means malformed or replayed requests never reach pool
+/// lifecycle code while the next supervisor slice is developed and tested.
+fn handle_relay_transfer_coordinator_event(
+    event: nostr::Event,
+    agent_pubkey_hex: &str,
+    owner_pubkey_hex: &str,
+) {
+    if event.kind.as_u16() as u32 != KIND_AGENT_TRANSFER_COORDINATOR {
+        tracing::warn!("unexpected event kind on transfer coordinator channel");
+        return;
+    }
+    if let Err(error) = buzz_core::verify_event(&event) {
+        tracing::warn!(error = %error, "transfer coordinator request failed signature verification");
+        return;
+    }
+    if event.pubkey.to_hex() != owner_pubkey_hex {
+        tracing::warn!(
+            sender = %event.pubkey,
+            expected = %owner_pubkey_hex,
+            "transfer coordinator request from non-owner — dropping"
+        );
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let event_ts = event.created_at.as_secs() as i64;
+    if (event_ts - now).unsigned_abs() > 300 {
+        tracing::warn!(
+            event_ts,
+            now,
+            "transfer coordinator request is stale — dropping"
+        );
+        return;
+    }
+    let (tagged_owner, tagged_agent) = match transfer_coordinator_tags(&event) {
+        Ok(tags) => tags,
+        Err(error) => {
+            tracing::warn!(error = %error, "transfer coordinator request has invalid routing tags");
+            return;
+        }
+    };
+    if tagged_owner != owner_pubkey_hex || tagged_agent != agent_pubkey_hex {
+        tracing::warn!(
+            tagged_owner,
+            tagged_agent,
+            "transfer coordinator request is not addressed to this runtime"
+        );
+        return;
+    }
+    let envelope = match TransferCoordinatorEnvelope::from_json(&event.content) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            tracing::warn!(error = %error, "transfer coordinator request payload is invalid");
+            return;
+        }
+    };
+    match envelope.message {
+        TransferCoordinatorMessage::OwnerRequest {
+            request: TransferOwnerRequest::Start { transfer },
+        } if transfer.agent_pubkey == agent_pubkey_hex => {
+            tracing::info!(
+                operation_id = %transfer.operation_id,
+                revision = transfer.revision,
+                epoch = transfer.epoch,
+                phase = ?transfer.phase,
+                source = %transfer.source.instance_id,
+                target = %transfer.target.instance_id,
+                "validated transfer request at runtime boundary"
+            );
+        }
+        TransferCoordinatorMessage::OwnerRequest { .. } => {
+            tracing::warn!("transfer coordinator owner request targets another agent — dropping");
+        }
+        TransferCoordinatorMessage::ExecutorCommand { .. } => {
+            tracing::warn!("executor command is not accepted on the owner delivery channel");
+        }
+    }
+}
+
+fn transfer_coordinator_tags(event: &nostr::Event) -> Result<(String, String), &'static str> {
+    let mut owner = None;
+    let mut agent = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() != 2 {
+            return Err("transfer coordinator tags must contain exactly two values");
+        }
+        let value = parts[1].as_str();
+        if !nostr::PublicKey::from_hex(value)
+            .map(|key| key.to_hex() == value)
+            .unwrap_or(false)
+        {
+            return Err("transfer coordinator tag is not canonical public-key hex");
+        }
+        match parts[0].as_str() {
+            "p" if owner.is_none() => owner = Some(value.to_owned()),
+            "agent" if agent.is_none() => agent = Some(value.to_owned()),
+            _ => return Err("transfer coordinator has unsupported or duplicate tags"),
+        }
+    }
+    Ok((
+        owner.ok_or("transfer coordinator is missing the `p` tag")?,
+        agent.ok_or("transfer coordinator is missing the `agent` tag")?,
+    ))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectOwnerAnnouncementControl {
@@ -2532,6 +2646,14 @@ async fn tokio_main() -> Result<()> {
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
     let mut relay_observer_publisher = None;
+    if owner_cache.pubkey.is_some() {
+        relay
+            .subscribe_transfer_coordinator()
+            .await
+            .map_err(|e| anyhow::anyhow!("transfer coordinator subscribe error: {e}"))?;
+        relay_observer_control_rx = relay.take_observer_control_rx();
+        tracing::info!("transfer coordinator subscription enabled");
+    }
     if config.relay_observer {
         if let (Some(observer), Some(owner_pubkey_hex)) =
             (observer.clone(), owner_cache.pubkey.clone())
@@ -2550,7 +2672,6 @@ async fn tokio_main() -> Result<()> {
                         .subscribe_observer_controls()
                         .await
                         .map_err(|e| anyhow::anyhow!("observer control subscribe error: {e}"))?;
-                    relay_observer_control_rx = relay.take_observer_control_rx();
                     tracing::info!("relay observer enabled");
                 }
                 Err(error) => {
@@ -3078,7 +3199,19 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx;
                     match control_event {
                         Some(event) => {
-                            if let Some(ref owner_hex) = owner_cache.pubkey {
+                            if event.kind.as_u16() as u32 == KIND_AGENT_TRANSFER_COORDINATOR {
+                                if let Some(ref owner_hex) = owner_cache.pubkey {
+                                    handle_relay_transfer_coordinator_event(
+                                        event,
+                                        &pubkey_hex,
+                                        owner_hex,
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "transfer coordinator request received but no owner resolved — dropping"
+                                    );
+                                }
+                            } else if let Some(ref owner_hex) = owner_cache.pubkey {
                                 handle_relay_observer_control_event(
                                     &config.keys,
                                     event,

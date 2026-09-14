@@ -659,6 +659,8 @@ enum RelayMessage {
 const MEMBERSHIP_NOTIF_SUB_ID: &str = "membership-notif";
 /// Subscription ID for encrypted owner-to-agent observer control frames.
 const OBSERVER_CONTROL_SUB_ID: &str = "agent-observer-control";
+/// Subscription ID for relay-readable transfer coordinator requests.
+const TRANSFER_COORDINATOR_SUB_ID: &str = "agent-transfer-coordinator";
 
 /// Commands sent from `HarnessRelay` to the background WebSocket task.
 enum RelayCommand {
@@ -678,6 +680,8 @@ enum RelayCommand {
     SubscribeMembership,
     /// Subscribe to encrypted observer control frames addressed to this agent.
     SubscribeObserverControls,
+    /// Subscribe to relay-readable transfer coordinator requests addressed to this agent.
+    SubscribeTransferCoordinator,
     /// Publish a signed event to the relay (for typing indicators, etc.).
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
@@ -944,7 +948,16 @@ impl HarnessRelay {
         Ok(())
     }
 
-    /// Take the observer-control receiver for polling outside this relay object.
+    /// Subscribe to relay-readable transfer coordinator requests addressed to this agent.
+    pub async fn subscribe_transfer_coordinator(&mut self) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::SubscribeTransferCoordinator)
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        Ok(())
+    }
+
+    /// Take the agent-control receiver for polling outside this relay object.
     pub fn take_observer_control_rx(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.observer_control_rx.take()
     }
@@ -1155,6 +1168,8 @@ struct BgState {
     membership_sub_active: bool,
     /// Whether the observer control subscription is active.
     observer_control_sub_active: bool,
+    /// Whether the transfer coordinator subscription is active.
+    transfer_coordinator_sub_active: bool,
     /// Oldest dropped channel-event timestamp per channel, keyed by channel_id.
     /// Mirrors `membership_dropped_since` but for ordinary channel events.
     /// On reconnect resubscribe, `since` = min(last_seen, channel_dropped_since).
@@ -1195,6 +1210,9 @@ struct BgState {
     /// subscription. The main-loop drain re-sends the REQ once the gate clears,
     /// even when `rate_limited_pending` is empty.
     observer_resub_needed: bool,
+    /// Set when a rate-limited CLOSED arrives for the transfer coordinator
+    /// subscription.
+    transfer_resub_needed: bool,
     /// Observer telemetry frames (kind 24200) parked while the rate-limit gate
     /// is armed. Unlike typing indicators, these frames are durable telemetry:
     /// dropping them silently loses turn history in the Desktop observer.
@@ -1236,6 +1254,7 @@ impl BgState {
             membership_last_seen: None,
             membership_sub_active: false,
             observer_control_sub_active: false,
+            transfer_coordinator_sub_active: false,
             channel_dropped_since: HashMap::new(),
             proactive_resubscribe_needed: false,
             startup_watermark: None,
@@ -1244,6 +1263,7 @@ impl BgState {
             rate_limited_pending: HashMap::new(),
             membership_resub_needed: false,
             observer_resub_needed: false,
+            transfer_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
@@ -1472,6 +1492,9 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
         RelayCommand::SubscribeObserverControls => {
             state.observer_control_sub_active = true;
         }
+        RelayCommand::SubscribeTransferCoordinator => {
+            state.transfer_coordinator_sub_active = true;
+        }
         RelayCommand::SetStartupWatermark { ts } => {
             state.startup_watermark = Some(ts);
             if state.membership_last_seen.is_none() {
@@ -1663,6 +1686,23 @@ async fn execute_connected_command(
             } else {
                 warn!("observer control subscribe REQ failed — recording intent for reconnect");
                 state.observer_resub_needed = true;
+                false
+            }
+        }
+        RelayCommand::SubscribeTransferCoordinator => {
+            state.transfer_coordinator_sub_active = true;
+            if state.check_rate_gate().is_some() {
+                debug!("rate-gated: deferring transfer coordinator subscription");
+                state.transfer_resub_needed = true;
+                return true;
+            }
+            let sent = send_transfer_coordinator_subscribe(ws, agent_pubkey_hex).await;
+            if sent {
+                state.transfer_resub_needed = false;
+                true
+            } else {
+                warn!("transfer coordinator subscribe REQ failed — recording intent for reconnect");
+                state.transfer_resub_needed = true;
                 false
             }
         }
@@ -1939,6 +1979,17 @@ async fn run_background_task(
                     } else {
                         warn!(
                             "observer control resub after rate-limit failed — will retry next drain"
+                        );
+                    }
+                }
+                if state.transfer_resub_needed && budget > 0 {
+                    if send_transfer_coordinator_subscribe(&mut ws, &agent_pubkey_hex).await {
+                        state.transfer_resub_needed = false;
+                        budget = budget.saturating_sub(1);
+                        any_sent = true;
+                    } else {
+                        warn!(
+                            "transfer coordinator resub after rate-limit failed — will retry next drain"
                         );
                     }
                 }
@@ -2267,11 +2318,15 @@ async fn handle_ws_message(
                     subscription_id,
                     event,
                 } => {
-                    if subscription_id == OBSERVER_CONTROL_SUB_ID {
+                    if subscription_id == OBSERVER_CONTROL_SUB_ID
+                        || subscription_id == TRANSFER_COORDINATOR_SUB_ID
+                    {
                         match observer_control_tx.try_send(*event) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!("observer control event dropped because control channel is full");
+                                warn!(
+                                    "agent control event dropped because control channel is full"
+                                );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
@@ -2448,6 +2503,8 @@ async fn handle_ws_message(
                             state.membership_resub_needed = true;
                         } else if subscription_id == OBSERVER_CONTROL_SUB_ID {
                             state.observer_resub_needed = true;
+                        } else if subscription_id == TRANSFER_COORDINATOR_SUB_ID {
+                            state.transfer_resub_needed = true;
                         }
                         return true; // keep the socket
                     }
@@ -2480,6 +2537,14 @@ async fn handle_ws_message(
                             state.observer_control_sub_active = true;
                         } else {
                             warn!("observer control resubscribe failed after CLOSED — triggering reconnect");
+                            return false;
+                        }
+                    } else if subscription_id == TRANSFER_COORDINATOR_SUB_ID {
+                        let sent = send_transfer_coordinator_subscribe(ws, agent_pubkey_hex).await;
+                        if sent {
+                            state.transfer_coordinator_sub_active = true;
+                        } else {
+                            warn!("transfer coordinator resubscribe failed after CLOSED — triggering reconnect");
                             return false;
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
@@ -2822,6 +2887,23 @@ async fn resubscribe_after_reconnect(
         }
     }
 
+    if state.transfer_coordinator_sub_active {
+        if state.check_rate_gate().is_some() {
+            debug!("rate-gated: parking transfer coordinator resubscribe after reconnect");
+            state.transfer_resub_needed = true;
+        } else {
+            if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
+                return ResubscribeResult::Shutdown;
+            }
+            if !send_transfer_coordinator_subscribe(ws, agent_pubkey_hex).await {
+                warn!("failed to resubscribe transfer coordinator after reconnect");
+                retain_deferred_command_intent(state, &mut deferred_commands);
+                return ResubscribeResult::RetryConnection;
+            }
+            state.transfer_resub_needed = false;
+        }
+    }
+
     match drain_commands(ws, cmd_rx, &mut deferred_commands, state, agent_pubkey_hex).await {
         ReconnectOutcome::Ok => ResubscribeResult::Ok,
         ReconnectOutcome::Failed => ResubscribeResult::RetryConnection,
@@ -3058,7 +3140,8 @@ async fn drain_commands(
             }
             RelayCommand::Subscribe { .. }
             | RelayCommand::SubscribeMembership
-            | RelayCommand::SubscribeObserverControls => {
+            | RelayCommand::SubscribeObserverControls
+            | RelayCommand::SubscribeTransferCoordinator => {
                 // A gated subscription is only parked in state; pace only an
                 // actual live send attempt.
                 let pace_after = state.check_rate_gate().is_none();
@@ -3526,6 +3609,41 @@ async fn send_observer_control_subscribe(ws: &mut WsStream, agent_pubkey_hex: &s
         }
         Err(e) => {
             warn!("failed to serialize observer control REQ: {e}");
+            false
+        }
+    }
+}
+
+/// Send a NIP-01 REQ for relay-readable transfer coordinator requests.
+async fn send_transfer_coordinator_subscribe(ws: &mut WsStream, agent_pubkey_hex: &str) -> bool {
+    let req = json!([
+        "REQ",
+        TRANSFER_COORDINATOR_SUB_ID,
+        {
+            "kinds": [buzz_core::kind::KIND_AGENT_TRANSFER_COORDINATOR],
+            "#agent": [agent_pubkey_hex],
+            "since": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    ]);
+
+    match serde_json::to_string(&req) {
+        Ok(text) => {
+            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
+                Ok(()) => {
+                    debug!("subscribed to transfer coordinator requests");
+                    true
+                }
+                Err(e) => {
+                    warn!("failed to send transfer coordinator REQ: {e}");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to serialize transfer coordinator REQ: {e}");
             false
         }
     }
@@ -4729,6 +4847,17 @@ mod tests {
         let uuid = Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
         let sub_id = channel_sub_id(uuid);
         assert_eq!(sub_id, "ch-12345678-1234-5678-1234-567812345678");
+    }
+
+    #[test]
+    fn transfer_coordinator_subscription_intent_survives_disconnect() {
+        let mut state = BgState::new();
+        apply_command_to_state(&mut state, RelayCommand::SubscribeTransferCoordinator);
+        assert!(state.transfer_coordinator_sub_active);
+        assert!(!state.transfer_resub_needed);
+
+        state.transfer_resub_needed = true;
+        assert!(state.transfer_resub_needed);
     }
 
     /// Build a real signed Nostr event for testing BgState.

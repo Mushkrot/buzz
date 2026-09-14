@@ -59,6 +59,12 @@ pub struct TransferCoordinator {
 /// request shapes.
 pub type ExecutorCommandRequest = TransferExecutorCommand;
 
+/// Subscription identifier used for the best-effort live delivery of a
+/// coordinator request to the target runtime. The event is not persisted or
+/// broadcast as a timeline event; an offline target is handled by the durable
+/// coordinator state and a future outbox/recovery pass.
+const COORDINATOR_DELIVERY_SUB_ID: &str = "agent-transfer-coordinator";
+
 /// Handle one relay-readable signed transfer request.
 ///
 /// The request is intentionally ephemeral: it is authenticated, authorized,
@@ -150,6 +156,12 @@ pub async fn handle_coordinator_event(
         }
     }
 
+    let deliver_to_target = matches!(
+        &envelope.message,
+        TransferCoordinatorMessage::OwnerRequest {
+            request: TransferOwnerRequest::Start { .. }
+        }
+    );
     let response = state
         .transfer_coordinator
         .dispatch_wire(
@@ -159,7 +171,23 @@ pub async fn handle_coordinator_event(
         )
         .await;
     match response {
-        Ok(response) => send_coordinator_response(&conn, event_id_hex, true, response),
+        Ok(response) => {
+            if deliver_to_target {
+                let delivered = deliver_to_target_connections(
+                    &state,
+                    conn.tenant.community(),
+                    &route.agent,
+                    &event,
+                );
+                tracing::info!(
+                    event_id = %event_id_hex,
+                    agent = %route.agent,
+                    delivered,
+                    "transfer coordinator request accepted; live target delivery attempted"
+                );
+            }
+            send_coordinator_response(&conn, event_id_hex, true, response)
+        }
         Err(error) => match map_coordinator_error(error) {
             Some(response) => send_coordinator_response(&conn, event_id_hex, false, response),
             None => {
@@ -171,6 +199,27 @@ pub async fn handle_coordinator_event(
             }
         },
     }
+}
+
+/// Deliver a coordinator start request to active target sockets.
+///
+/// This is intentionally a narrow adapter: the relay does not infer process
+/// state and does not claim delivery when the target is offline. Durable
+/// recovery for that case belongs to the outbox/supervisor seam that consumes
+/// the transfer record.
+fn deliver_to_target_connections(
+    state: &crate::state::AppState,
+    community: buzz_core::CommunityId,
+    agent: &nostr::PublicKey,
+    event: &nostr::Event,
+) -> usize {
+    let frame = crate::protocol::RelayMessage::event(COORDINATOR_DELIVERY_SUB_ID, event);
+    state
+        .conn_manager
+        .connection_ids_for_pubkey_in_community(community, &agent.to_bytes())
+        .into_iter()
+        .filter(|conn_id| state.conn_manager.send_to(*conn_id, frame.clone()))
+        .count()
 }
 
 #[derive(Debug, Clone, Copy)]
