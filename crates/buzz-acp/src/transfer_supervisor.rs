@@ -133,6 +133,23 @@ pub(crate) fn command_for(
     }
 }
 
+/// Whether applying this command transfers authority away from the local
+/// source and therefore permits the runtime adapter to stop its ACP pool.
+///
+/// The check is intentionally pure and tied to the pre-transition snapshot:
+/// callers must publish the command first, then perform the irreversible local
+/// stop. A stale command or a command from another executor never qualifies.
+pub(crate) fn should_stop_source(
+    record: &TransferRecord,
+    local_instance_id: &str,
+    command: &buzz_core::agent_transfer::TransferExecutorCommand,
+) -> bool {
+    record.phase == TransferPhase::SourceQuiesced
+        && record.source.instance_id == local_instance_id
+        && command.executor_instance_id == local_instance_id
+        && command.command == buzz_core::agent_transfer::TransferCommand::ActivateTarget
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +266,28 @@ mod tests {
             ),
             Some(buzz_core::agent_transfer::TransferCommand::Complete)
         );
+    }
+
+    #[test]
+    fn source_stops_only_on_its_fenced_activation_command() {
+        let transfer = record();
+        let command = buzz_core::agent_transfer::TransferExecutorCommand {
+            agent_pubkey: transfer.agent_pubkey.clone(),
+            operation_id: transfer.operation_id.clone(),
+            executor_instance_id: "source-1".into(),
+            expected_revision: transfer.revision,
+            expected_epoch: transfer.epoch,
+            command: buzz_core::agent_transfer::TransferCommand::ActivateTarget,
+        };
+        let mut quiesced = transfer.clone();
+        quiesced.phase = TransferPhase::SourceQuiesced;
+        assert!(should_stop_source(&quiesced, "source-1", &command));
+        assert!(!should_stop_source(&quiesced, "target-1", &command));
+
+        let mut stale = command.clone();
+        stale.executor_instance_id = "other-source".into();
+        assert!(!should_stop_source(&quiesced, "source-1", &stale));
+        assert!(!should_stop_source(&transfer, "source-1", &command));
     }
 
     #[test]

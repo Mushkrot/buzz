@@ -4063,6 +4063,11 @@ async fn tokio_main() -> Result<()> {
                     }
                     ValidatedTransferEvent::ExecutorCommand { event_id, command } => {
                         if let Some(current) = local_transfer_state.as_mut() {
+                            let stop_source_after_apply = transfer_supervisor::should_stop_source(
+                                &current.record,
+                                &local_transfer_instance_id,
+                                &command,
+                            );
                             match current.apply_command(
                                 event_id,
                                 command,
@@ -4076,6 +4081,26 @@ async fn tokio_main() -> Result<()> {
                                 ),
                                 Ok(false) => {}
                                 Err(error) => tracing::warn!("{error}"),
+                            }
+                            if stop_source_after_apply
+                                && current.record.phase
+                                    == buzz_core::agent_transfer::TransferPhase::Activating
+                            {
+                                emit_runtime_lifecycle(
+                                    observer.as_ref(),
+                                    &runtime_start_nonce,
+                                    &pubkey_hex,
+                                    &config.relay_url,
+                                    "stopping",
+                                    None,
+                                );
+                                tracing::info!(
+                                    operation_id = %current.record.operation_id,
+                                    instance = %local_transfer_instance_id,
+                                    "transfer authority moved to target — stopping source ACP pool"
+                                );
+                                shutdown_agent_pool(&mut pool).await;
+                                break;
                             }
                         } else {
                             tracing::warn!(
