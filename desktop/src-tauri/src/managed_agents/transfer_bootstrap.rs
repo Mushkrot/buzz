@@ -77,43 +77,40 @@ async fn reconcile_loop(app: AppHandle) {
             );
         }
 
-        let mut workers = match state.transfer_bootstrap_workers.lock() {
-            Ok(workers) => workers,
+        match state.transfer_bootstrap_workers.lock() {
+            Ok(mut workers) => {
+                let stale: Vec<String> = workers
+                    .iter()
+                    .filter_map(|(pubkey, (fingerprint, _))| {
+                        desired
+                            .get(pubkey)
+                            .filter(|(next_fingerprint, _)| next_fingerprint == fingerprint)
+                            .is_none()
+                            .then_some(pubkey.clone())
+                    })
+                    .collect();
+                for pubkey in stale {
+                    if let Some((_, token)) = workers.remove(&pubkey) {
+                        token.cancel();
+                    }
+                }
+
+                for (pubkey, (fingerprint, worker_relay_url)) in desired {
+                    if workers.contains_key(&pubkey) {
+                        continue;
+                    }
+                    let cancel = CancellationToken::new();
+                    workers.insert(pubkey.clone(), (fingerprint, cancel.clone()));
+                    let worker_app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        worker_loop(worker_app, pubkey, worker_relay_url, cancel).await;
+                    });
+                }
+            }
             Err(error) => {
                 eprintln!("buzz-desktop: transfer bootstrap worker lock failed: {error}");
-                tokio::time::sleep(RECONCILE_INTERVAL).await;
-                continue;
-            }
-        };
-
-        let stale: Vec<String> = workers
-            .iter()
-            .filter_map(|(pubkey, (fingerprint, _))| {
-                desired
-                    .get(pubkey)
-                    .filter(|(next_fingerprint, _)| next_fingerprint == fingerprint)
-                    .is_none()
-                    .then_some(pubkey.clone())
-            })
-            .collect();
-        for pubkey in stale {
-            if let Some((_, token)) = workers.remove(&pubkey) {
-                token.cancel();
             }
         }
-
-        for (pubkey, (fingerprint, worker_relay_url)) in desired {
-            if workers.contains_key(&pubkey) {
-                continue;
-            }
-            let cancel = CancellationToken::new();
-            workers.insert(pubkey.clone(), (fingerprint, cancel.clone()));
-            let worker_app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                worker_loop(worker_app, pubkey, worker_relay_url, cancel).await;
-            });
-        }
-        drop(workers);
 
         tokio::time::sleep(RECONCILE_INTERVAL).await;
     }
@@ -335,6 +332,7 @@ mod tests {
                 },
             },
         )
+        .unwrap()
         .to_json()
         .unwrap();
         EventBuilder::new(
