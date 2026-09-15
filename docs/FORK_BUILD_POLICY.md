@@ -1,8 +1,11 @@
 # Fork build policy
 
 This document defines how the `Mushkrot/buzz` fork produces test builds for
-the owner's Apple Silicon Mac. It is intentionally separate from the upstream
-release lanes and from any future branded product release.
+Apple Silicon Macs. It is intentionally separate from the upstream release
+lanes and from any future branded product release.
+
+The implementation phase status is tracked in
+[`PROJECT_PLAN.md`](PROJECT_PLAN.md).
 
 ## Default path
 
@@ -24,12 +27,13 @@ The following rules are part of the workflow contract, not suggestions:
 1. The fork stays public and uses only the standard `macos-latest` hosted
    runner. Larger runners are not allowed in this lane.
 2. The workflow is manual (`workflow_dispatch`) only. A new run cancels an
-   older run in the same lane, so repeated clicks cannot accumulate parallel
-   builds.
+   older in-progress run in the same lane, so repeated clicks cannot create
+   parallel builds. Completed runs may each retain one artifact until their
+   one-day expiry; the workflow does not create a cleanup job.
 3. Actions Cache is not used. The macOS runner is temporary; its Cargo,
    pnpm, Tauri, and build directories disappear with the job.
-4. Exactly one ARM64 DMG is uploaded as one Actions artifact. Only a checksum
-   and a small build-provenance text file accompany it.
+4. Exactly one ARM64 DMG is uploaded per completed run as one Actions artifact.
+   Only a checksum and a small build-provenance text file accompany it.
 5. The artifact is retained for one day. There is no GitHub Release, package,
    updater manifest, or other durable publishing step.
 6. The DMG is capped at 300 MiB. A growth beyond that limit fails the job
@@ -70,10 +74,12 @@ gh api repos/Mushkrot/buzz/actions/cache/usage
 gh run download <run-id> --repo Mushkrot/buzz --name <artifact-name>
 ```
 
-The expected steady state is one recent ARM64 artifact (or none after its
-one-day expiry) and zero Actions caches. If an older artifact appears, inspect
-its exact name and delete only that artifact through GitHub; do not add a broad
-cleanup job with write permissions.
+The expected steady state is zero Actions caches and only the deliberately
+short-lived artifacts from recent completed runs. Multiple artifacts can exist
+briefly because GitHub expires them independently after one day. If an older
+artifact must be removed before expiry, inspect its exact name and delete only
+that artifact through GitHub; do not add a broad cleanup job with write
+permissions.
 
 ## What this policy does not cover
 

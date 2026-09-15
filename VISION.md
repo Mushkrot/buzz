@@ -230,7 +230,7 @@ Greenfield. Agent swarms build in parallel, integrating at the event store bound
 | ✅ | Huddles — WebSocket Opus voice relay + lifecycle events (recording/tracks planned) |
 | ✅ | Buzz Mesh — relay-gated shared AI compute (mesh-llm over iroh); members pool GPUs, agents consume via a local OpenAI-compatible endpoint |
 | 🚧 | Mobile client — Flutter app (channels, forum, search, profile, pairing); in active development |
-| 📋 | Remote agents — provider-based deployment to remote substrates (Kubernetes first); spec in review |
+| 🚧 | Remote agents — transfer foundation, provider protocol, and Kubernetes provider implemented; live cross-runtime validation and final hardening remain |
 | 📋 | Developer portal, push notifications, culture features |
 
 ---

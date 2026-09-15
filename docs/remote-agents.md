@@ -28,6 +28,30 @@ configuration**, **presence-is-status**, **at-most-one-live-instance**, and
 **intentional-termination-is-final** — and argue each from the protocol
 rules.
 
+## Implementation status
+
+This specification remains the normative contract. The current implementation
+has landed the transfer foundation across the relay, database, ACP harness,
+desktop target bootstrap, and Kubernetes provider. The desktop emits the
+resolved `launch` block, negotiates the provider protocol on a staged
+executable before sending the identity, and supports the independent
+inactivity timer. The Sprig image and provider are present in the repository.
+
+The remaining completion gate is live cross-runtime verification: exercise an
+offline target, target activation, source shutdown ordering, retry/restart
+recovery, and one-live-instance convergence on an isolated environment. The
+historical defect list below is retained as a review baseline and is not a
+claim that every item still describes the current tree.
+
+The normative sections preserve the design rationale that led to the
+implementation. For present-day status, use this section, the implementation
+correspondence table, and [`PROJECT_PLAN.md`](PROJECT_PLAN.md); references to
+`28ae6cd21` identify the historical review baseline rather than the current
+source tree.
+
+Phase status and acceptance gates are tracked in
+[`PROJECT_PLAN.md`](PROJECT_PLAN.md).
+
 A scoping note that governs the whole document: the desktop is **one
 launcher among many**. What makes a process a live Buzz agent is a keypair,
 a NIP-OA auth tag, and a relay URL, handed as environment to the `buzz-acp`
@@ -333,10 +357,11 @@ to a binary discovery would not have found.
 
 **Pre-secret negotiation gate (normative).** Declaring `protocol_version`
 is worthless if nothing checks it before the nsec crosses the trust
-boundary — and at `28ae6cd21` nothing does: `provider_deploy` invokes
+boundary. At the historical baseline (`28ae6cd21`), `provider_deploy` invoked
 `deploy` directly, so a stale UI-time probe (or a binary replaced on PATH
-since that probe) can receive `private_key_nsec` unchecked (Known Defect
-5). The deploy path MUST: resolve the provider id **once**; copy the
+since that probe) could receive `private_key_nsec` unchecked (Known Defect
+5). The current deploy path implements the required sequence: resolve the
+provider id **once**; copy the
 resolved candidate into a desktop-owned, private, non-writable **staging
 file**, computing its digest during the copy; invoke `info` **on the
 staged artifact**; validate an explicit, supported `protocol_version`
@@ -422,9 +447,11 @@ response: {"ok": true, "agent_id": str}
 timeout:  600s
 ```
 
-The agent payload (field list per
-`commands/agents_deploy.rs: deploy_payload_json` at `28ae6cd21`; the
-`launch` block is a normative addition not yet emitted — Known Defect 3):
+The agent payload is assembled by
+`commands/agents_deploy.rs: deploy_payload_json`; the current desktop deploy
+path emits the resolved `launch` block. The historical baseline at
+`28ae6cd21` omitted that block (Known Defect 3), which is retained below as
+design rationale rather than current status:
 
 | field | meaning |
 |---|---|
@@ -432,7 +459,7 @@ The agent payload (field list per
 | `relay_url` | concrete WS URL (workspace fallback materialized — the remote side has no workspace notion) |
 | `private_key_nsec` | **the identity** (I1: never empty) |
 | `auth_tag` | NIP-OA owner attestation |
-| `agent_command`, `agent_args` | the ACP agent under the harness (configurable-harness support). At `28ae6cd21` these are raw record bytes — see Known Defect 3: the normative source is the resolved descriptor in `launch` |
+| `agent_command`, `agent_args` | the ACP agent under the harness (configurable-harness support); the resolved descriptor in `launch` is the authoritative source |
 | `system_prompt`, `model`, `provider` | effective values, live-persona-first resolution |
 | `turn_timeout_seconds`, `idle_timeout_seconds`, `max_turn_duration_seconds` | harness timeout knobs |
 | `parallelism` | concurrent-turn bound |
@@ -956,6 +983,12 @@ I5's enforcement point. A new harness knob:
   evaluate. The reaper therefore runs on its own timer, independent of pool
   state (an idle-pool check needs no pool). Check granularity makes the
   effective bound `t ∈ [T, T+interval)`, immaterial at T=7200.
+
+  Current implementation note: the harness timer and reserved environment key
+  are present. The Kubernetes provider currently requires a positive
+  `inactivity_seconds` value while its restart policy remains `Never`; the
+  indefinite `0` opt-out is therefore still a hardening item, not a supported
+  provider configuration.
 - **Reserved keys**: `BUZZ_ACP_EXIT_AFTER_INACTIVITY` MUST join
   `RESERVED_ENV_KEYS` (`env_vars.rs`) when it lands — it is tier-3
   authoritative (§Launch data), and without reservation a user env var
@@ -1578,7 +1611,7 @@ the wrong tool here: the failure modes found in review were wrong
 delete, phase-as-readiness, non-atomic Secret→pod against GC), which a
 hand-written model would have reproduced convincingly.
 
-## Known Defects (at `28ae6cd21`)
+## Historical Known Defects (review baseline at `28ae6cd21`)
 
 **Citation pin:** every `file:line` reference in this document was verified
 against `28ae6cd21` — the commit at which this spec merged to `main`.
@@ -1690,21 +1723,21 @@ Desktop- and harness-side, discovered during this design:
 |---|---|
 | Discovery, resolution rule | `desktop/src-tauri/src/managed_agents/backend.rs` (`discover_provider_candidates`, `resolve_provider_binary`) |
 | Invocation, output caps, exit rule | `backend.rs` (`invoke_provider`) |
-| Pre-secret negotiation gate | *to be added*: `backend.rs` deploy path — resolve-once → stage-and-digest → `info` → explicit-version check → `deploy` on the staged bytes (Known Defect 5) |
+| Pre-secret negotiation gate | `backend.rs` deploy path — resolve-once → stage-and-digest → `info` → explicit-version check → `deploy` on the staged bytes |
 | Redaction | `backend.rs` (`redact_secrets_with`) |
 | I2 validation | `backend.rs` (`validate_provider_config`) |
 | I1 refusal, payload | `desktop/src-tauri/src/commands/agents_deploy.rs` |
-| Launch resolver (shared with local spawn) | `desktop/src-tauri/src/managed_agents/readiness.rs` (`resolve_effective_harness_descriptor`); `launch` block emission *to be added* to `agents_deploy.rs` (Known Defect 3) |
+| Launch resolver (shared with local spawn) | `desktop/src-tauri/src/managed_agents/readiness.rs` (`resolve_effective_harness_descriptor`) and `commands/agents_deploy.rs` (`build_launch_block`) |
 | Mesh rewrite (why relay-mesh is non-deployable) | `desktop/src-tauri/src/managed_agents/relay_mesh.rs`; create-time rejection in `commands/agents.rs` (`normalize_relay_mesh`) |
 | Reserved-key strip | `desktop/src-tauri/src/managed_agents/env_vars.rs` (`RESERVED_ENV_KEYS`) |
 | Unconditional deploy on Start | `desktop/src-tauri/src/commands/agents.rs` (`start_managed_agent`) |
 | Presence publish / offline-on-exit | `crates/buzz-acp/src/lib.rs` (`publish_presence`, shutdown path) |
 | `!shutdown` owner check | `crates/buzz-acp/src/lib.rs` (main loop) |
-| Graceful shutdown path (budget enforcement *to be added* — Known Defect 7) | `crates/buzz-acp/src/lib.rs` (pool shutdown, then drain / reap / presence / relay close) |
-| Clean-exit exit-code contract | *to be added*: `crates/buzz-acp` distinguished exit codes + pinning test (Known Defect 6; gates `OnFailure`) |
-| Auto-stop flag | *to be added*: `crates/buzz-acp/src/config.rs` + a pool-independent timer (NOT the `pool_ready`-gated maintenance tick — Known Defect 4) + `RESERVED_ENV_KEYS` entry |
-| Kubernetes binding | *to be added*: `crates/buzz-backend-kubernetes` |
-| Sprig image | *to be added*: `Dockerfile.sprig` + workflow |
+| Graceful shutdown path | `crates/buzz-acp/src/lib.rs` (pool shutdown, drain / reap / presence / relay close); the shared end-to-end grace-budget guarantee remains open |
+| Clean-exit exit-code contract | **Open hardening item**: `crates/buzz-acp` still needs distinguished exit-code semantics plus a pinning test before any `OnFailure` supervisor policy is allowed (Known Defect 6) |
+| Auto-stop flag | `crates/buzz-acp/src/config.rs` plus a pool-independent timer and `RESERVED_ENV_KEYS` entry |
+| Kubernetes binding | `crates/buzz-backend-kubernetes` |
+| Sprig image | `Dockerfile.sprig`, `scripts/sprig-entrypoint.sh`, and the Sprig build workflow |
 
 ## Open Decisions
 
