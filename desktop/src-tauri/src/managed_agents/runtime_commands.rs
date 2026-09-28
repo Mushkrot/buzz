@@ -269,6 +269,7 @@ fn start_pair(
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    super::transfer_bootstrap::cancel_for_runtime_start(&state, &key.pubkey);
     let pending_transfer_bootstrap = state
         .transfer_bootstrap_events
         .lock()

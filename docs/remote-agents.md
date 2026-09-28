@@ -35,7 +35,10 @@ has landed the transfer foundation across the relay, database, ACP harness,
 desktop target bootstrap, and Kubernetes provider. The desktop emits the
 resolved `launch` block, negotiates the provider protocol on a staged
 executable before sending the identity, and supports the independent
-inactivity timer. The Sprig image and provider are present in the repository.
+inactivity timer. The desktop's offline bootstrap listener is disabled while
+the corresponding local ACP runtime is active, so one agent identity has only
+one consumer for durable transfer commands. The Sprig image and provider are
+present in the repository.
 
 The remaining completion gate is live cross-runtime verification: exercise an
 offline target, target activation, source shutdown ordering, retry/restart

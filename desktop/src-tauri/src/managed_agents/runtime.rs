@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
 
@@ -958,6 +958,8 @@ pub fn start_managed_agent_process(
     workspace_relay: &crate::relay::ScopedWorkspaceRelay,
 ) -> Result<(), String> {
     let key = bound_runtime_key(record, workspace_relay)?;
+    let state = app.state::<crate::app_state::AppState>();
+    super::transfer_bootstrap::cancel_for_runtime_start(&state, &key.pubkey);
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
             .child

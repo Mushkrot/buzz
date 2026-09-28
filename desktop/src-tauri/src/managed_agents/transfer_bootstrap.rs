@@ -6,7 +6,11 @@
 //! reserved environment variable. ACP then feeds it through its normal
 //! transfer validation path. This module owns no transfer state transitions.
 
-use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::Ordering,
+    time::Duration,
+};
 
 use buzz_core_pkg::agent_transfer::{
     TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferOwnerRequest, TransferPhase,
@@ -61,60 +65,104 @@ async fn reconcile_loop(app: AppHandle) {
                 continue;
             }
         };
-
-        let mut desired = HashMap::new();
-        for record in records
-            .into_iter()
-            .filter(|record| record.backend == BackendKind::Local)
-        {
-            if record.private_key_nsec.trim().is_empty() {
-                continue;
-            }
-            desired.insert(
-                record.pubkey.clone(),
-                (
-                    format!("{relay_url}|{}", record.updated_at),
-                    relay_url.clone(),
-                ),
-            );
-        }
-
-        match state.transfer_bootstrap_workers.lock() {
-            Ok(mut workers) => {
-                let stale: Vec<String> = workers
-                    .iter()
-                    .filter_map(|(pubkey, (fingerprint, _))| {
-                        desired
-                            .get(pubkey)
-                            .filter(|(next_fingerprint, _)| next_fingerprint == fingerprint)
-                            .is_none()
-                            .then_some(pubkey.clone())
-                    })
-                    .collect();
-                for pubkey in stale {
-                    if let Some((_, token)) = workers.remove(&pubkey) {
-                        token.cancel();
-                    }
-                }
-
-                for (pubkey, (fingerprint, worker_relay_url)) in desired {
-                    if workers.contains_key(&pubkey) {
-                        continue;
-                    }
-                    let cancel = CancellationToken::new();
-                    workers.insert(pubkey.clone(), (fingerprint, cancel.clone()));
-                    let worker_app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        worker_loop(worker_app, pubkey, worker_relay_url, cancel).await;
-                    });
-                }
-            }
-            Err(error) => {
-                eprintln!("buzz-desktop: transfer bootstrap worker lock failed: {error}");
-            }
+        if let Err(error) = reconcile_workers(&app, &state, records, &relay_url) {
+            eprintln!("buzz-desktop: transfer bootstrap reconcile failed: {error}");
         }
 
         tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
+}
+
+fn reconcile_workers(
+    app: &AppHandle,
+    state: &AppState,
+    records: Vec<ManagedAgentRecord>,
+    relay_url: &str,
+) -> Result<(), String> {
+    // Serialize the running-runtime snapshot and worker replacement with
+    // runtime start/stop. This closes the short window where reconcile could
+    // create an offline listener while the ACP process was starting.
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let running = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let mut desired = HashMap::new();
+    for record in records
+        .into_iter()
+        .filter(|record| record.backend == BackendKind::Local)
+    {
+        if record.private_key_nsec.trim().is_empty()
+            || !worker_needed(&record.pubkey, relay_url, &running)
+        {
+            continue;
+        }
+        desired.insert(
+            record.pubkey.clone(),
+            (
+                format!("{relay_url}|{}", record.updated_at),
+                relay_url.to_string(),
+            ),
+        );
+    }
+
+    let mut workers = state
+        .transfer_bootstrap_workers
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let stale: Vec<String> = workers
+        .iter()
+        .filter_map(|(pubkey, (fingerprint, _))| {
+            desired
+                .get(pubkey)
+                .filter(|(next_fingerprint, _)| next_fingerprint == fingerprint)
+                .is_none()
+                .then_some(pubkey.clone())
+        })
+        .collect();
+    for pubkey in stale {
+        if let Some((_, token)) = workers.remove(&pubkey) {
+            token.cancel();
+        }
+    }
+
+    for (pubkey, (fingerprint, worker_relay_url)) in desired {
+        if workers.contains_key(&pubkey) {
+            continue;
+        }
+        let cancel = CancellationToken::new();
+        workers.insert(pubkey.clone(), (fingerprint, cancel.clone()));
+        let worker_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            worker_loop(worker_app, pubkey, worker_relay_url, cancel).await;
+        });
+    }
+    Ok(())
+}
+
+fn worker_needed(pubkey: &str, relay_url: &str, running: &HashSet<ManagedAgentRuntimeKey>) -> bool {
+    ManagedAgentRuntimeKey::new(pubkey.to_string(), relay_url)
+        .map(|key| !running.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Remove the offline bootstrap listener before an ACP runtime starts.
+///
+/// Both listeners authenticate as the same agent. Leaving the offline listener
+/// connected while ACP is live lets it consume the relay's one durable transfer
+/// delivery before ACP can apply it.
+pub(crate) fn cancel_for_runtime_start(state: &AppState, pubkey: &str) {
+    if let Ok(mut workers) = state.transfer_bootstrap_workers.lock() {
+        if let Some((_, token)) = workers.remove(pubkey) {
+            token.cancel();
+        }
     }
 }
 
@@ -315,6 +363,19 @@ mod tests {
         TransferRecord,
     };
     use nostr::{EventBuilder, Tag};
+
+    #[test]
+    fn running_agent_does_not_get_competing_bootstrap_worker() {
+        let pubkey = "ab".repeat(32);
+        let relay = "wss://relay.example";
+        let key = ManagedAgentRuntimeKey::new(pubkey.clone(), relay).unwrap();
+        let running = HashSet::from([key]);
+
+        assert!(
+            !worker_needed(&pubkey, relay, &running),
+            "a running ACP process must be the only transfer consumer"
+        );
+    }
 
     fn owner_start(agent: &Keys, owner: &Keys, target: &str) -> Event {
         let record = TransferRecord::new(
