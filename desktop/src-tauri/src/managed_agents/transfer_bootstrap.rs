@@ -9,11 +9,11 @@
 use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 
 use buzz_core_pkg::agent_transfer::{
-    TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferOwnerRequest,
-    TransferPhase, TRANSFER_COORDINATOR_EVENT_KIND,
+    TransferCoordinatorEnvelope, TransferCoordinatorMessage, TransferOwnerRequest, TransferPhase,
+    TRANSFER_COORDINATOR_EVENT_KIND, TRANSFER_COORDINATOR_SUB_ID,
 };
 use buzz_ws_client_pkg::{NostrWsConnection, RelayMessage};
-use nostr::{Keys, Event};
+use nostr::{Event, Keys};
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,6 @@ use crate::{
     relay::relay_ws_url_with_override,
 };
 
-const SUBSCRIPTION_ID_PREFIX: &str = "managed-agent-transfer-bootstrap";
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -73,7 +72,10 @@ async fn reconcile_loop(app: AppHandle) {
             }
             desired.insert(
                 record.pubkey.clone(),
-                (format!("{relay_url}|{}", record.updated_at), relay_url.clone()),
+                (
+                    format!("{relay_url}|{}", record.updated_at),
+                    relay_url.clone(),
+                ),
             );
         }
 
@@ -125,7 +127,7 @@ fn cancel_all_workers(state: &AppState) {
 }
 
 async fn worker_loop(app: AppHandle, pubkey: String, relay_url: String, cancel: CancellationToken) {
-    let subscription_id = format!("{SUBSCRIPTION_ID_PREFIX}-{pubkey}");
+    let subscription_id = TRANSFER_COORDINATOR_SUB_ID;
     let mut retry_delay = RETRY_BASE;
 
     loop {
@@ -363,6 +365,8 @@ mod tests {
         let owner = Keys::generate();
         let mut event = owner_start(&agent, &owner, "target");
         event.content = "{}".into();
-        assert!(validate_owner_start_event(&event, &agent.public_key().to_hex(), "target").is_err());
+        assert!(
+            validate_owner_start_event(&event, &agent.public_key().to_hex(), "target").is_err()
+        );
     }
 }

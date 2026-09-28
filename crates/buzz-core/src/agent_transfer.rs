@@ -15,6 +15,12 @@ pub const TRANSFER_PROTOCOL_VERSION: u32 = 1;
 /// The event carries only the public transfer state-machine request. Secrets
 /// and ACP payloads remain on the encrypted observer-frame path (kind 24200).
 pub use crate::kind::KIND_AGENT_TRANSFER_COORDINATOR as TRANSFER_COORDINATOR_EVENT_KIND;
+/// Reserved subscription identifier for private coordinator replay and live delivery.
+///
+/// The relay uses this exact identifier to distinguish transfer history from
+/// ordinary community timeline subscriptions. All runtime adapters must use
+/// the same value to receive an offline owner's durable start request.
+pub const TRANSFER_COORDINATOR_SUB_ID: &str = "agent-transfer-coordinator";
 const MAX_REASON_BYTES: usize = 512;
 const MAX_MESSAGE_ID_BYTES: usize = 128;
 
