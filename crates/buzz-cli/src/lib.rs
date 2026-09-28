@@ -262,6 +262,8 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Start a fenced transfer of an existing agent to a prepared executor
+    TransferStart(TransferStartArgs),
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -365,6 +367,35 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+}
+
+/// Explicit transfer coordinates; the same operation ID is safe to retry.
+#[derive(clap::Args)]
+pub struct TransferStartArgs {
+    /// UUID of the agent's current community
+    #[arg(long)]
+    pub community_id: String,
+    /// Existing managed-agent public key (lowercase hex)
+    #[arg(long)]
+    pub agent_pubkey: String,
+    /// Stable transfer ID; reuse it when retrying an unknown result
+    #[arg(long)]
+    pub operation_id: String,
+    /// Instance ID currently running the agent
+    #[arg(long)]
+    pub source_instance: String,
+    /// Prepared destination's stable instance ID
+    #[arg(long)]
+    pub target_instance: String,
+    /// Human-readable source label, not an authority check
+    #[arg(long)]
+    pub source_location: String,
+    /// Human-readable target label, not an authority check
+    #[arg(long)]
+    pub target_location: String,
+    /// Explicit revision of the configuration staged at the target
+    #[arg(long)]
+    pub config_revision: u64,
 }
 
 #[derive(Subcommand)]
@@ -2293,6 +2324,7 @@ mod tests {
                 "archived",
                 "draft-create",
                 "draft-update",
+                "transfer-start",
                 "unarchive"
             ]
         );
@@ -2432,7 +2464,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

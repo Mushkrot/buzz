@@ -11,6 +11,7 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::TransferStart(args) => super::agent_transfer::start(client, &args).await,
         AgentsCmd::DraftCreate {
             channel,
             display_name,

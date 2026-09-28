@@ -67,6 +67,12 @@ buzz users set-status --clear                 # remove your status
 buzz dms open --pubkey <hex>
 buzz dms list
 
+# Owner-controlled transfer (after the destination is provisioned and listening)
+buzz agents transfer-start --community-id <uuid> --agent-pubkey <hex> \
+  --operation-id <stable-id> --source-instance <current-instance> \
+  --target-instance <prepared-instance> --source-location <label> \
+  --target-location <label> --config-revision <number>
+
 # Workflows
 buzz workflows list --channel <uuid>
 buzz workflows trigger --workflow <uuid>
@@ -95,6 +101,12 @@ buzz repos protect remove --id my-repo --ref refs/heads/main
 # Pipe to jq
 buzz channels list | jq '.[].name'
 ```
+
+`transfer-start` signs the coordinator request with `BUZZ_PRIVATE_KEY` on the
+owner's device. It contains executor coordinates, not private keys or provider
+credentials. Stage the same agent identity and working model configuration on
+only the intended destination before sending it. Reuse the operation ID after
+an uncertain result; do not start a second normal agent process manually.
 
 `protect set` replaces every existing rule for the exact ref pattern. Any
 constraint omitted from the command is removed. `protect list` reports malformed
